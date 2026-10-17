@@ -54,11 +54,11 @@ pipeline {
                 echo "Loading ${FULL_IMAGE} into the minikube node's container runtime"
                 sh '''
                     set -e
-                    docker save "${FULL_IMAGE}" -o /tmp/${IMAGE_NAME}-${IMAGE_TAG}.tar
-                    docker cp /tmp/${IMAGE_NAME}-${IMAGE_TAG}.tar minikube:/${IMAGE_NAME}-${IMAGE_TAG}.tar
-                    docker exec minikube ctr -n k8s.io images import /${IMAGE_NAME}-${IMAGE_TAG}.tar
-                    rm -f /tmp/${IMAGE_NAME}-${IMAGE_TAG}.tar
-                    docker exec minikube rm -f /${IMAGE_NAME}-${IMAGE_TAG}.tar
+                    # This minikube node uses Docker as its container runtime (cri-dockerd),
+                    # so kubelet reads images from the node's Docker daemon.
+                    docker save "${FULL_IMAGE}" | docker exec -i minikube docker load
+                    # Fail here, not 3 minutes later in the rollout, if the tag is missing:
+                    docker exec minikube docker image inspect "${FULL_IMAGE}" > /dev/null
                 '''
             }
         }
