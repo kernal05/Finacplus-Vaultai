@@ -18,6 +18,9 @@ spec:
         - name: vaultai-api
           image: vaultai-api:build-1
           imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: vaultai-secrets
           ports:
             - containerPort: 8000
           resources:
