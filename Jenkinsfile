@@ -134,7 +134,7 @@ pipeline {
                         kubectl exec -n ${K8S_NAMESPACE} --kubeconfig="$KUBECONFIG" deploy/${K8S_DEPLOYMENT} -- \
                             python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/healthz').read().decode())"
                         kubectl exec -n ${K8S_NAMESPACE} --kubeconfig="$KUBECONFIG" deploy/vaultai-web -- \
-                            wget -qO- http://localhost/healthz
+                            wget -qO- http://127.0.0.1/healthz
                     '''
                 }
             }
