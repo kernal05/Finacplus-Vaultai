@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vaultai-web
+  namespace: vaultai-staging
+  labels:
+    app: vaultai-web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vaultai-web
+  template:
+    metadata:
+      labels:
+        app: vaultai-web
+    spec:
+      containers:
+        - name: vaultai-web
+          image: vaultai-web:build-1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vaultai-web-service
+  namespace: vaultai-staging
+spec:
+  selector:
+    app: vaultai-web
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+  type: ClusterIP
