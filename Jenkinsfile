@@ -43,11 +43,22 @@ pipeline {
         }
 
         stage('Load Image into Minikube') {
+            // NOTE: this is a local-dev workaround for the single-node minikube
+            // cluster used in this assignment, which has no container registry.
+            // In production (GKE/EKS/AKS), this stage would not exist: the
+            // pipeline would "docker push" to a real registry (GCR/ECR/GHCR)
+            // and the cluster's nodes would pull from there automatically via
+            // imagePullPolicy, the same way kubectl set image already works
+            // in the next stage.
             steps {
-                echo "Loading ${FULL_IMAGE} into the minikube cluster's local image cache"
+                echo "Loading ${FULL_IMAGE} into the minikube node's container runtime"
                 sh '''
                     set -e
-                    minikube image load "${FULL_IMAGE}"
+                    docker save "${FULL_IMAGE}" -o /tmp/${IMAGE_NAME}-${IMAGE_TAG}.tar
+                    docker cp /tmp/${IMAGE_NAME}-${IMAGE_TAG}.tar minikube:/${IMAGE_NAME}-${IMAGE_TAG}.tar
+                    docker exec minikube ctr -n k8s.io images import /${IMAGE_NAME}-${IMAGE_TAG}.tar
+                    rm -f /tmp/${IMAGE_NAME}-${IMAGE_TAG}.tar
+                    docker exec minikube rm -f /${IMAGE_NAME}-${IMAGE_TAG}.tar
                 '''
             }
         }
