@@ -1,13 +1,31 @@
 // =============================================================================
-// VaultAI CI/CD pipeline (Declarative Pipeline + Groovy helper functions)
+// CI/CD pipeline (Declarative Pipeline + Groovy helper functions)
 //
 // Flow:  build -> load images -> [secret -> deploy -> smoke test] STAGING
 //        -> manual approval (no executor held) -> same image to PRODUCTION
 //
-// Environment differences live in k8s/overlays/<env> (Kustomize) and in
-// envConfig() below. Adding an environment = one overlay folder + one map entry.
+// TO ONBOARD ANOTHER SERVICE:   edit appConfig()  (one map per component)
+// TO ADD AN ENV OR CLUSTER:     add an entry in envConfig() + k8s/overlays/<env>
 // Images are built once and promoted, never rebuilt for production.
 // =============================================================================
+
+// ---- Application configuration (edit this to onboard a service) --------------
+def appConfig() {
+    return [
+        deployBranch: 'main',        // only this branch deploys
+        minikubeNode: 'minikube',    // local-dev image loading; use a registry push for real clusters
+        secretName  : 'vaultai-secrets',
+        secretKey   : 'ANTHROPIC_API_KEY',
+        components  : [
+            [deployment: 'vaultai-api', container: 'vaultai-api', image: 'vaultai-api',
+             dockerfile: 'api/Dockerfile', context: 'api/',
+             smoke: 'python -c "import urllib.request; print(urllib.request.urlopen(\'http://localhost:8000/healthz\').read().decode())"'],
+            [deployment: 'vaultai-web', container: 'vaultai-web', image: 'vaultai-web',
+             dockerfile: 'app/Dockerfile', context: '.',
+             smoke: 'wget -qO- http://127.0.0.1/healthz'],
+        ],
+    ]
+}
 
 // ---- Per-environment configuration -------------------------------------------
 // Give prod its own kubeconfig / API key credentials by changing the two
@@ -25,12 +43,47 @@ def envConfig(String name) {
     return all[name]
 }
 
-// ---- Reusable steps ----------------------------------------------------------
+// ---- Helpers -----------------------------------------------------------------
+
+def imageRef(Map c) {
+    return "${c.image}:${env.IMAGE_TAG}".toString()
+}
+
+def imageList() {
+    def refs = []
+    for (c in appConfig().components) {
+        refs << imageRef(c)
+    }
+    return refs.join(' / ')
+}
+
+def buildImages() {
+    for (c in appConfig().components) {
+        withEnv(["IMG=${imageRef(c)}", "DOCKERFILE=${c.dockerfile}", "CONTEXT=${c.context}"]) {
+            echo "Building ${env.IMG} from ${env.DOCKERFILE}"
+            sh 'set -e; docker build -t "$IMG" -f "$DOCKERFILE" "$CONTEXT"'
+        }
+    }
+}
+
+def loadImages() {
+    def app = appConfig()
+    for (c in app.components) {
+        withEnv(["IMG=${imageRef(c)}", "NODE=${app.minikubeNode}"]) {
+            sh '''
+                set -e
+                docker save "$IMG" | docker exec -i "$NODE" docker load
+                docker exec "$NODE" docker image inspect "$IMG" > /dev/null
+            '''
+        }
+    }
+}
 
 // Create/update the app secret BEFORE deploying so pods start with current values.
 def syncSecret(String envName) {
     def cfg = envConfig(envName)
-    withEnv(["NS=${cfg.ns}"]) {
+    def app = appConfig()
+    withEnv(["NS=${cfg.ns}", "SECRET=${app.secretName}", "SKEY=${app.secretKey}"]) {
         withCredentials([
             file(credentialsId: cfg.kubeCred, variable: 'KUBECONFIG'),
             string(credentialsId: cfg.keyCred, variable: 'ANTHROPIC_KEY')
@@ -38,8 +91,8 @@ def syncSecret(String envName) {
             sh '''
                 set +x
                 set -e
-                kubectl create secret generic vaultai-secrets \
-                    --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_KEY" \
+                kubectl create secret generic "$SECRET" \
+                    --from-literal="$SKEY=$ANTHROPIC_KEY" \
                     -n "$NS" --kubeconfig="$KUBECONFIG" \
                     --dry-run=client -o yaml | kubectl apply -f - --kubeconfig="$KUBECONFIG"
             '''
@@ -50,21 +103,36 @@ def syncSecret(String envName) {
 // Apply overlay, roll to this build's images, roll back automatically on failure.
 def deployEnv(String envName) {
     def cfg = envConfig(envName)
+    def comps = appConfig().components
     withEnv(["NS=${cfg.ns}", "OVERLAY=${cfg.overlay}"]) {
         withCredentials([file(credentialsId: cfg.kubeCred, variable: 'KUBECONFIG')]) {
-            sh '''
-                set -e
-                kubectl apply -k "$OVERLAY" --kubeconfig="$KUBECONFIG"
-                kubectl set image deployment/vaultai-api vaultai-api="$API_IMAGE" -n "$NS" --kubeconfig="$KUBECONFIG"
-                kubectl set image deployment/vaultai-web vaultai-web="$WEB_IMAGE" -n "$NS" --kubeconfig="$KUBECONFIG"
-                if ! kubectl rollout status deployment/vaultai-api -n "$NS" --kubeconfig="$KUBECONFIG" --timeout=180s \
-                   || ! kubectl rollout status deployment/vaultai-web -n "$NS" --kubeconfig="$KUBECONFIG" --timeout=180s; then
-                    echo "Rollout failed in $NS - rolling back to previous revision"
-                    kubectl rollout undo deployment/vaultai-api -n "$NS" --kubeconfig="$KUBECONFIG" || true
-                    kubectl rollout undo deployment/vaultai-web -n "$NS" --kubeconfig="$KUBECONFIG" || true
-                    exit 1
-                fi
-            '''
+            sh 'set -e; kubectl apply -k "$OVERLAY" --kubeconfig="$KUBECONFIG"'
+
+            for (c in comps) {
+                withEnv(["DEPLOY=${c.deployment}", "CONTAINER=${c.container}", "IMG=${imageRef(c)}"]) {
+                    sh 'set -e; kubectl set image "deployment/$DEPLOY" "$CONTAINER=$IMG" -n "$NS" --kubeconfig="$KUBECONFIG"'
+                }
+            }
+
+            boolean ok = true
+            for (c in comps) {
+                if (!ok) { break }
+                withEnv(["DEPLOY=${c.deployment}"]) {
+                    int rc = sh(returnStatus: true,
+                                script: 'kubectl rollout status "deployment/$DEPLOY" -n "$NS" --kubeconfig="$KUBECONFIG" --timeout=180s')
+                    if (rc != 0) { ok = false }
+                }
+            }
+
+            if (!ok) {
+                echo "Rollout failed in ${cfg.ns}: rolling back every component to its previous revision"
+                for (c in comps) {
+                    withEnv(["DEPLOY=${c.deployment}"]) {
+                        sh 'kubectl rollout undo "deployment/$DEPLOY" -n "$NS" --kubeconfig="$KUBECONFIG" || true'
+                    }
+                }
+                error "Rollout failed in ${cfg.ns}; rolled back automatically."
+            }
         }
     }
 }
@@ -73,14 +141,12 @@ def smokeTest(String envName) {
     def cfg = envConfig(envName)
     withEnv(["NS=${cfg.ns}"]) {
         withCredentials([file(credentialsId: cfg.kubeCred, variable: 'KUBECONFIG')]) {
-            sh '''
-                set -e
-                kubectl get pods -n "$NS" --kubeconfig="$KUBECONFIG"
-                kubectl exec -n "$NS" --kubeconfig="$KUBECONFIG" deploy/vaultai-api -- \
-                    python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/healthz').read().decode())"
-                kubectl exec -n "$NS" --kubeconfig="$KUBECONFIG" deploy/vaultai-web -- \
-                    wget -qO- http://127.0.0.1/healthz
-            '''
+            sh 'kubectl get pods -n "$NS" --kubeconfig="$KUBECONFIG"'
+            for (c in appConfig().components) {
+                withEnv(["DEPLOY=${c.deployment}", "SMOKE_CMD=${c.smoke}"]) {
+                    sh 'set -e; kubectl exec -n "$NS" --kubeconfig="$KUBECONFIG" "deploy/$DEPLOY" -- sh -c "$SMOKE_CMD"'
+                }
+            }
         }
     }
 }
@@ -116,58 +182,32 @@ pipeline {
                         script {
                             env.GIT_COMMIT_SHORT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
                             env.IMAGE_TAG = "build-${env.BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}"
-                            env.API_IMAGE = "vaultai-api:${env.IMAGE_TAG}"
-                            env.WEB_IMAGE = "vaultai-web:${env.IMAGE_TAG}"
                             echo "Building commit ${env.GIT_COMMIT_SHORT} as ${env.IMAGE_TAG}"
                         }
                     }
                 }
 
-                stage('Build API Image') {
-                    steps {
-                        echo "Building ${env.API_IMAGE} from api/Dockerfile"
-                        sh '''
-                            set -e
-                            docker build -t "$API_IMAGE" -f api/Dockerfile api/
-                        '''
-                    }
-                }
-
-                stage('Build Web Image') {
-                    steps {
-                        echo "Building ${env.WEB_IMAGE} from app/Dockerfile"
-                        sh '''
-                            set -e
-                            docker build -t "$WEB_IMAGE" -f app/Dockerfile .
-                        '''
-                    }
+                stage('Build Images') {
+                    steps { script { buildImages() } }
                 }
 
                 stage('Load Images into Minikube') {
-                    when { branch 'main' }
-                    steps {
-                        sh '''
-                            set -e
-                            docker save "$API_IMAGE" | docker exec -i minikube docker load
-                            docker exec minikube docker image inspect "$API_IMAGE" > /dev/null
-                            docker save "$WEB_IMAGE" | docker exec -i minikube docker load
-                            docker exec minikube docker image inspect "$WEB_IMAGE" > /dev/null
-                        '''
-                    }
+                    when { expression { env.BRANCH_NAME == appConfig().deployBranch } }
+                    steps { script { loadImages() } }
                 }
 
                 stage('Sync Staging Secret') {
-                    when { branch 'main' }
+                    when { expression { env.BRANCH_NAME == appConfig().deployBranch } }
                     steps { script { syncSecret('staging') } }
                 }
 
                 stage('Deploy Staging') {
-                    when { branch 'main' }
+                    when { expression { env.BRANCH_NAME == appConfig().deployBranch } }
                     steps { script { deployEnv('staging') } }
                 }
 
                 stage('Staging Smoke Test') {
-                    when { branch 'main' }
+                    when { expression { env.BRANCH_NAME == appConfig().deployBranch } }
                     steps { script { smokeTest('staging') } }
                 }
             }
@@ -178,12 +218,12 @@ pipeline {
 
         // Runs on NO executor while waiting for a human.
         stage('Approve Production') {
-            when { branch 'main'; beforeAgent true }
+            when { expression { env.BRANCH_NAME == appConfig().deployBranch }; beforeAgent true }
             steps {
                 script {
                     def decision = timeout(time: 30, unit: 'MINUTES') {
                         input(
-                            message: "Staging passed for ${env.GIT_COMMIT_SHORT}. Promote ${env.API_IMAGE} / ${env.WEB_IMAGE}?",
+                            message: "Staging passed for ${env.GIT_COMMIT_SHORT}. Promote ${imageList()}?",
                             ok: 'Submit',
                             submitter: env.PROD_APPROVERS ?: '',
                             parameters: [choice(name: 'DECISION',
@@ -200,7 +240,7 @@ pipeline {
         stage('Production') {
             when {
                 allOf {
-                    branch 'main'
+                    expression { env.BRANCH_NAME == appConfig().deployBranch }
                     expression { env.DEPLOY_PROD == 'true' }
                 }
                 beforeAgent true
@@ -230,9 +270,9 @@ pipeline {
         success {
             script {
                 if (env.DEPLOY_PROD == 'true') {
-                    echo "Deployed ${env.API_IMAGE} and ${env.WEB_IMAGE} to staging and production."
+                    echo "Deployed ${imageList()} to staging and production."
                 } else {
-                    echo "Deployed ${env.API_IMAGE} and ${env.WEB_IMAGE} to staging. Production skipped."
+                    echo "Deployed ${imageList()} to staging. Production skipped."
                 }
             }
         }
