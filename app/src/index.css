@@ -1,0 +1,56 @@
+:root {
+  --marigold: #e8a23d;
+  --turmeric: #f2c14e;
+  --maroon: #7a2438;
+  --indigo: #1b2a4a;
+
+  /* One flip, applied everywhere — top bar, rail, stage, panel, dashboard. */
+  --bg-deep: #f5efe2;
+  --bg-deep-fg: #1b1712;
+  --bg-deep-fg-soft: rgba(27, 23, 18, 0.62);
+  --bg-deep-border: rgba(27, 23, 18, 0.12);
+
+  --surface: #ffffff;
+  --fg: #1b1712;
+  --fg-soft: #4a4339;
+  --border: rgba(27, 23, 18, 0.12);
+  --input-bg: #f7f3ea;
+  --input-border: rgba(27, 23, 18, 0.18);
+
+  --on-accent: #1b1712;
+  --accent2-fg: #7a2438;
+
+  --font-display: "Fraunces", serif;
+  --font-ui: "Inter", system-ui, sans-serif;
+}
+
+[data-theme="dark"] {
+  --bg-deep: #101a30;
+  --bg-deep-fg: #efe6d3;
+  --bg-deep-fg-soft: rgba(239, 230, 211, 0.65);
+  --bg-deep-border: rgba(239, 230, 211, 0.12);
+
+  --surface: #1b1626;
+  --fg: #efe6d3;
+  --fg-soft: rgba(239, 230, 211, 0.65);
+  --border: rgba(239, 230, 211, 0.15);
+  --input-bg: #201a2c;
+  --input-border: rgba(239, 230, 211, 0.2);
+
+  --on-accent: #1b1712;
+  --accent2-fg: #e2637e;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+
+body {
+  font-family: var(--font-ui);
+  background: var(--bg-deep);
+  color: var(--bg-deep-fg);
+  -webkit-font-smoothing: antialiased;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+
+button { font-family: inherit; cursor: pointer; }
+::selection { background: var(--marigold); color: var(--on-accent); }

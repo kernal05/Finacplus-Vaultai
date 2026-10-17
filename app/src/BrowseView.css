@@ -1,0 +1,47 @@
+.browse { padding: 32px 40px 60px; max-width: 1100px; margin: 0 auto; color: var(--bg-deep-fg); }
+.browse-tabs { display: flex; gap: 8px; margin-bottom: 24px; flex-wrap: wrap; }
+
+.browse-tab {
+  background: transparent;
+  border: 1px solid var(--bg-deep-border);
+  color: var(--bg-deep-fg);
+  opacity: 0.75;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 600;
+  padding: 9px 16px;
+  border-radius: 999px;
+}
+.browse-tab:hover { opacity: 1; }
+.browse-tab.active { background: var(--marigold); border-color: var(--marigold); color: var(--on-accent); opacity: 1; }
+
+.browse-title { font-family: var(--font-display); font-size: 32px; margin: 0 0 24px; color: var(--bg-deep-fg); }
+.browse-loading { font-family: var(--font-ui); color: var(--bg-deep-fg); opacity: 0.7; padding: 40px 0; }
+
+.browse-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 20px; }
+
+.quote-card {
+  border-radius: 12px;
+  padding: 24px 20px;
+  min-height: 180px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.25);
+  color: var(--card-fg);
+}
+.quote-text { font-family: var(--font-display); font-size: 19px; line-height: 1.4; color: var(--card-fg); margin: 0 0 16px; }
+.quote-actions { display: flex; gap: 8px; }
+.quote-actions button {
+  flex: 1;
+  background: color-mix(in srgb, var(--card-fg) 18%, transparent);
+  border: none;
+  border-radius: 6px;
+  padding: 8px 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--card-fg);
+}
+.quote-actions button:hover { background: color-mix(in srgb, var(--card-fg) 30%, transparent); }
+
+.hidden-canvas { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
