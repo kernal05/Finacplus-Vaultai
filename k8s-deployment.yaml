@@ -1,0 +1,60 @@
+# k8s-deployment.yaml
+# Target workload the Jenkinsfile's "Deploy to Kubernetes" stage updates.
+# Apply once manually to create it; Jenkins only patches the image after that.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vaultai-api
+  namespace: vaultai-staging
+  labels:
+    app: vaultai-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vaultai-api
+  template:
+    metadata:
+      labels:
+        app: vaultai-api
+    spec:
+      containers:
+        - name: vaultai-api
+          image: vaultai-api:build-1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vaultai-api-service
+  namespace: vaultai-staging
+spec:
+  selector:
+    app: vaultai-api
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
+  type: ClusterIP
