@@ -5,18 +5,12 @@ pipeline {
         timestamps()
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '20'))
-        timeout(time: 30, unit: 'MINUTES')
-    }
-
-    parameters {
-        string(name: 'IMAGE_NAME', defaultValue: 'vaultai-api', description: 'API container image name')
-        string(name: 'K8S_NAMESPACE', defaultValue: 'vaultai-staging', description: 'Target Kubernetes namespace (vaultai-staging or vaultai-prod)')
-        string(name: 'K8S_DEPLOYMENT', defaultValue: 'vaultai-api', description: 'API deployment object to update')
+        timeout(time: 60, unit: 'MINUTES')
     }
 
     environment {
         IMAGE_TAG  = "build-${env.BUILD_NUMBER}"
-        FULL_IMAGE = "${params.IMAGE_NAME}:${IMAGE_TAG}"
+        API_IMAGE  = "vaultai-api:${IMAGE_TAG}"
         WEB_IMAGE  = "vaultai-web:${IMAGE_TAG}"
         KUBECONFIG_CRED_ID = 'minikube-kubeconfig'
         ANTHROPIC_CRED_ID  = 'vaultai-anthropic-key'
@@ -36,10 +30,10 @@ pipeline {
 
         stage('Build API Image') {
             steps {
-                echo "Building ${FULL_IMAGE} from api/Dockerfile"
+                echo "Building ${API_IMAGE} from api/Dockerfile"
                 sh '''
                     set -e
-                    docker build -t "${FULL_IMAGE}" -f api/Dockerfile api/
+                    docker build -t "${API_IMAGE}" -f api/Dockerfile api/
                 '''
             }
         }
@@ -55,21 +49,37 @@ pipeline {
         }
 
         stage('Load Images into Minikube') {
-            // Local-dev workaround for the single-node minikube cluster, which has
-            // no container registry. In production this stage becomes "docker push"
-            // to a real registry (GHCR/ECR/GCR) and the nodes pull from it.
             steps {
                 sh '''
                     set -e
-                    docker save "${FULL_IMAGE}" | docker exec -i minikube docker load
-                    docker exec minikube docker image inspect "${FULL_IMAGE}" > /dev/null
+                    docker save "${API_IMAGE}" | docker exec -i minikube docker load
+                    docker exec minikube docker image inspect "${API_IMAGE}" > /dev/null
                     docker save "${WEB_IMAGE}" | docker exec -i minikube docker load
                     docker exec minikube docker image inspect "${WEB_IMAGE}" > /dev/null
                 '''
             }
         }
 
-        stage('Sync API Secret') {
+        stage('Deploy Staging') {
+            when { branch 'main' }
+            steps {
+                withCredentials([file(credentialsId: env.KUBECONFIG_CRED_ID, variable: 'KUBECONFIG')]) {
+                    sh '''
+                        set -e
+                        kubectl apply -k k8s/overlays/staging --kubeconfig="$KUBECONFIG"
+                        kubectl set image deployment/vaultai-api vaultai-api=${API_IMAGE} \
+                            -n vaultai-staging --kubeconfig="$KUBECONFIG"
+                        kubectl set image deployment/vaultai-web vaultai-web=${WEB_IMAGE} \
+                            -n vaultai-staging --kubeconfig="$KUBECONFIG"
+                        kubectl rollout status deployment/vaultai-api -n vaultai-staging --kubeconfig="$KUBECONFIG" --timeout=180s
+                        kubectl rollout status deployment/vaultai-web -n vaultai-staging --kubeconfig="$KUBECONFIG" --timeout=180s
+                    '''
+                }
+            }
+        }
+
+        stage('Sync Staging Secret') {
+            when { branch 'main' }
             steps {
                 withCredentials([
                     file(credentialsId: env.KUBECONFIG_CRED_ID, variable: 'KUBECONFIG'),
@@ -80,60 +90,89 @@ pipeline {
                         set -e
                         kubectl create secret generic vaultai-secrets \
                             --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_KEY" \
-                            -n ${K8S_NAMESPACE} --kubeconfig="$KUBECONFIG" \
+                            -n vaultai-staging --kubeconfig="$KUBECONFIG" \
                             --dry-run=client -o yaml | kubectl apply -f - --kubeconfig="$KUBECONFIG"
-                        kubectl set env deployment/${K8S_DEPLOYMENT} --from=secret/vaultai-secrets \
-                            -n ${K8S_NAMESPACE} --kubeconfig="$KUBECONFIG"
+                        kubectl set env deployment/vaultai-api --from=secret/vaultai-secrets \
+                            -n vaultai-staging --kubeconfig="$KUBECONFIG"
                     '''
                 }
             }
         }
 
-        stage('Deploy API') {
+        stage('Staging Smoke Test') {
+            when { branch 'main' }
             steps {
                 withCredentials([file(credentialsId: env.KUBECONFIG_CRED_ID, variable: 'KUBECONFIG')]) {
                     sh '''
                         set -e
-                        kubectl set image deployment/${K8S_DEPLOYMENT} \
-                            ${IMAGE_NAME}=${FULL_IMAGE} \
-                            -n ${K8S_NAMESPACE} \
-                            --kubeconfig="$KUBECONFIG"
-                        kubectl rollout status deployment/${K8S_DEPLOYMENT} \
-                            -n ${K8S_NAMESPACE} \
-                            --kubeconfig="$KUBECONFIG" \
-                            --timeout=180s
-                    '''
-                }
-            }
-        }
-
-        stage('Deploy Web') {
-            steps {
-                withCredentials([file(credentialsId: env.KUBECONFIG_CRED_ID, variable: 'KUBECONFIG')]) {
-                    sh '''
-                        set -e
-                        kubectl set image deployment/vaultai-web \
-                            vaultai-web=${WEB_IMAGE} \
-                            -n ${K8S_NAMESPACE} \
-                            --kubeconfig="$KUBECONFIG"
-                        kubectl rollout status deployment/vaultai-web \
-                            -n ${K8S_NAMESPACE} \
-                            --kubeconfig="$KUBECONFIG" \
-                            --timeout=180s
-                    '''
-                }
-            }
-        }
-
-        stage('Smoke Test') {
-            steps {
-                withCredentials([file(credentialsId: env.KUBECONFIG_CRED_ID, variable: 'KUBECONFIG')]) {
-                    sh '''
-                        set -e
-                        kubectl get pods -n ${K8S_NAMESPACE} --kubeconfig="$KUBECONFIG"
-                        kubectl exec -n ${K8S_NAMESPACE} --kubeconfig="$KUBECONFIG" deploy/${K8S_DEPLOYMENT} -- \
+                        kubectl get pods -n vaultai-staging --kubeconfig="$KUBECONFIG"
+                        kubectl exec -n vaultai-staging --kubeconfig="$KUBECONFIG" deploy/vaultai-api -- \
                             python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/healthz').read().decode())"
-                        kubectl exec -n ${K8S_NAMESPACE} --kubeconfig="$KUBECONFIG" deploy/vaultai-web -- \
+                        kubectl exec -n vaultai-staging --kubeconfig="$KUBECONFIG" deploy/vaultai-web -- \
+                            wget -qO- http://127.0.0.1/healthz
+                    '''
+                }
+            }
+        }
+
+        stage('Approve Production') {
+            when { branch 'main' }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: "Staging passed for ${env.GIT_COMMIT_SHORT}. Promote ${API_IMAGE} / ${WEB_IMAGE} to PRODUCTION?", ok: 'Deploy to prod'
+                }
+            }
+        }
+
+        stage('Deploy Production') {
+            when { branch 'main' }
+            steps {
+                withCredentials([file(credentialsId: env.KUBECONFIG_CRED_ID, variable: 'KUBECONFIG')]) {
+                    sh '''
+                        set -e
+                        kubectl apply -k k8s/overlays/prod --kubeconfig="$KUBECONFIG"
+                        kubectl set image deployment/vaultai-api vaultai-api=${API_IMAGE} \
+                            -n vaultai-prod --kubeconfig="$KUBECONFIG"
+                        kubectl set image deployment/vaultai-web vaultai-web=${WEB_IMAGE} \
+                            -n vaultai-prod --kubeconfig="$KUBECONFIG"
+                        kubectl rollout status deployment/vaultai-api -n vaultai-prod --kubeconfig="$KUBECONFIG" --timeout=180s
+                        kubectl rollout status deployment/vaultai-web -n vaultai-prod --kubeconfig="$KUBECONFIG" --timeout=180s
+                    '''
+                }
+            }
+        }
+
+        stage('Sync Production Secret') {
+            when { branch 'main' }
+            steps {
+                withCredentials([
+                    file(credentialsId: env.KUBECONFIG_CRED_ID, variable: 'KUBECONFIG'),
+                    string(credentialsId: env.ANTHROPIC_CRED_ID, variable: 'ANTHROPIC_KEY')
+                ]) {
+                    sh '''
+                        set +x
+                        set -e
+                        kubectl create secret generic vaultai-secrets \
+                            --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_KEY" \
+                            -n vaultai-prod --kubeconfig="$KUBECONFIG" \
+                            --dry-run=client -o yaml | kubectl apply -f - --kubeconfig="$KUBECONFIG"
+                        kubectl set env deployment/vaultai-api --from=secret/vaultai-secrets \
+                            -n vaultai-prod --kubeconfig="$KUBECONFIG"
+                    '''
+                }
+            }
+        }
+
+        stage('Production Smoke Test') {
+            when { branch 'main' }
+            steps {
+                withCredentials([file(credentialsId: env.KUBECONFIG_CRED_ID, variable: 'KUBECONFIG')]) {
+                    sh '''
+                        set -e
+                        kubectl get pods -n vaultai-prod --kubeconfig="$KUBECONFIG"
+                        kubectl exec -n vaultai-prod --kubeconfig="$KUBECONFIG" deploy/vaultai-api -- \
+                            python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/healthz').read().decode())"
+                        kubectl exec -n vaultai-prod --kubeconfig="$KUBECONFIG" deploy/vaultai-web -- \
                             wget -qO- http://127.0.0.1/healthz
                     '''
                 }
@@ -143,12 +182,18 @@ pipeline {
 
     post {
         success {
-            echo "Deployed ${FULL_IMAGE} and ${WEB_IMAGE} to ${params.K8S_NAMESPACE} successfully."
+            echo "Pipeline complete for ${env.GIT_COMMIT_SHORT}: ${API_IMAGE} and ${WEB_IMAGE} deployed."
         }
         failure {
-            echo "Pipeline failed at commit ${env.GIT_COMMIT_SHORT}. Rollback commands:"
-            echo "kubectl rollout undo deployment/${params.K8S_DEPLOYMENT} -n ${params.K8S_NAMESPACE}"
-            echo "kubectl rollout undo deployment/vaultai-web -n ${params.K8S_NAMESPACE}"
+            echo "Pipeline failed at commit ${env.GIT_COMMIT_SHORT}."
+            echo "If staging failed, prod was never touched -- no rollback needed there."
+            echo "If prod failed after deploying, roll back with:"
+            echo "kubectl rollout undo deployment/vaultai-api -n vaultai-prod"
+            echo "kubectl rollout undo deployment/vaultai-web -n vaultai-prod"
+        }
+        aborted {
+            echo "Build aborted -- likely the production approval window (30 min) timed out, or it was manually cancelled."
+            echo "Staging remains deployed; production was not touched."
         }
         always {
             cleanWs()
