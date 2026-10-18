@@ -270,3 +270,18 @@ and 3 prod API pods), and the Grafana dashboard loaded data from them.
   and use probe timeouts of 5 seconds instead of the default 1 second. The deploy stage also wraps
   `kubectl rollout status` in `timeout 240` so a stalled machine fails the build (and rolls back) in
   minutes instead of hanging it.
+
+## Image scan results (build 26)
+
+Trivy scans both images after they are built. It lists only findings that already have a fix available, and it is report-only, so findings do not fail the build. Results from build 26:
+
+| Image | Result |
+|---|---|
+| vaultai-web | 0 vulnerabilities. Before `apk upgrade` was added to its Dockerfile, the same image had 2 critical OpenSSL findings (libcrypto3 and libssl3). |
+| vaultai-api | 1 HIGH, 0 critical: libpcre2-8-0 (CVE-2026-103111), fixed in 10.46-1~deb13u3. All Python dependencies scanned clean. |
+
+Next step for the API image: run `apt-get upgrade` in its Dockerfile, as the web image does with `apk upgrade`. Once both images scan clean, `SCAN_ENFORCE_CRITICAL` can be switched to `'true'`.
+
+## Why not SonarQube
+
+Trivy checks images and dependencies for known vulnerabilities. SonarQube analyses the source code itself. I used ruff for code linting instead, because SonarQube needs its own server and a few GB of memory, which this local cluster doesn't have. In a larger setup I would add it, with a quality gate on the pipeline.
