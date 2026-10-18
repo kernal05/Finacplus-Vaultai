@@ -146,7 +146,7 @@ sudo systemctl enable --now smee-jenkins
 
 3. By default the Git plugin answers `401 An access token is required` to calls like this. The Jenkins version I used didn't show a place to create a notifyCommit token, so I set `NOTIFY_COMMIT_ACCESS_CONTROL=disabled-for-polling` in `JAVA_OPTS` instead. All that does is let the endpoint ask Jenkins to rescan the repo. It can't run anything else.
 
-The job also scans the repo every minute, so if the webhook path is down (for example the laptop was asleep), the push is still picked up a little later.
+If the webhook path is down (for example the laptop was asleep), use Scan Repository Now in Jenkins to pick up the missed push.
 
 On a real server with a public address, GitHub would call Jenkins directly and none of the smee setup would be needed.
 
