@@ -33,9 +33,9 @@ def appConfig() {
 def envConfig(String name) {
     def all = [
         staging: [ns: 'vaultai-staging', overlay: 'k8s/overlays/staging',
-                  kubeCred: 'minikube-kubeconfig', keyCred: 'vaultai-anthropic-key'],
+                  kubeCred: 'kubeconfig-staging', keyCred: 'vaultai-anthropic-key'],
         prod   : [ns: 'vaultai-prod',    overlay: 'k8s/overlays/prod',
-                  kubeCred: 'minikube-kubeconfig', keyCred: 'vaultai-anthropic-key'],
+                  kubeCred: 'kubeconfig-prod', keyCred: 'vaultai-anthropic-key'],
     ]
     if (!all.containsKey(name)) {
         error "Unknown environment '${name}'"
@@ -132,7 +132,7 @@ def deployEnv(String envName) {
         withCredentials([file(credentialsId: cfg.kubeCred, variable: 'KUBECONFIG')]) {
             sh '''
                 set -e
-                kubectl get nodes --request-timeout=20s --kubeconfig="$KUBECONFIG"
+                kubectl get deployments -n "$NS" --request-timeout=20s --kubeconfig="$KUBECONFIG"
                 cat image-pins.yaml >> "$OVERLAY/kustomization.yaml"
                 kubectl apply -k "$OVERLAY" --kubeconfig="$KUBECONFIG"
             '''
