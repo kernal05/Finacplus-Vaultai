@@ -1,10 +1,11 @@
+import json
+import logging
+import os
+
+from anthropic import Anthropic
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import Counter, make_asgi_app
-import logging
-import os
-import json
-from anthropic import Anthropic
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "info").upper(),

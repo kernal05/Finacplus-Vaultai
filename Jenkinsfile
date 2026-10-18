@@ -169,6 +169,43 @@ def smokeTest(String envName) {
     }
 }
 
+// ---- Quality gates -----------------------------------------------------------
+// ruff, trivy and its vulnerability database are installed into the Jenkins container by
+// jenkins/install-ci-tools.sh. The stages fail with a clear message if they are missing.
+
+def lintAndValidate() {
+    sh '''
+        set -e
+        command -v ruff > /dev/null || { echo "ruff is not installed in the Jenkins container: run jenkins/install-ci-tools.sh"; exit 1; }
+        ruff check api/
+        kubectl kustomize k8s/overlays/staging > /dev/null
+        kubectl kustomize k8s/overlays/prod > /dev/null
+        echo "Lint and manifest validation passed"
+    '''
+}
+
+// Report only by default: HIGH and CRITICAL findings that HAVE a fix are listed in the build log.
+// Set SCAN_ENFORCE_CRITICAL = 'true' in the environment block to fail the build on fixable CRITICAL findings.
+def scanImages() {
+    boolean enforce = (env.SCAN_ENFORCE_CRITICAL == 'true')
+    for (c in appConfig().components) {
+        withEnv(["IMG=${imageRef(c)}", "ENFORCE=${enforce}"]) {
+            sh '''
+                set -e
+                command -v trivy > /dev/null || { echo "trivy is not installed in the Jenkins container: run jenkins/install-ci-tools.sh"; exit 1; }
+                [ -d "$HOME/.cache/trivy/db" ] || { echo "Trivy database missing in $HOME/.cache/trivy: run jenkins/install-ci-tools.sh"; exit 1; }
+                COMMON="--skip-db-update --skip-java-db-update --skip-version-check --no-progress --scanners vuln --ignore-unfixed"
+                echo "Scanning $IMG (findings with an available fix, report only)"
+                trivy image $COMMON --severity HIGH,CRITICAL --exit-code 0 "$IMG"
+                if [ "$ENFORCE" = "true" ]; then
+                    echo "Enforcing: failing the build on fixable CRITICAL findings"
+                    trivy image $COMMON --severity CRITICAL --exit-code 1 --quiet "$IMG"
+                fi
+            '''
+        }
+    }
+}
+
 // ---- Pipeline ----------------------------------------------------------------
 
 pipeline {
@@ -186,6 +223,8 @@ pipeline {
         // Comma-separated Jenkins user IDs/groups allowed to approve prod.
         // Empty = any user who can build. Set this before real use.
         PROD_APPROVERS = 'devops-admin'
+        // 'true' = fail the build on fixable CRITICAL image findings (report-only while 'false').
+        SCAN_ENFORCE_CRITICAL = 'false'
     }
 
     stages {
@@ -205,8 +244,24 @@ pipeline {
                     }
                 }
 
+                stage('Quality Checks') {
+                    steps {
+                        timeout(time: 5, unit: 'MINUTES') {
+                            script { lintAndValidate() }
+                        }
+                    }
+                }
+
                 stage('Build Images') {
                     steps { script { buildImages() } }
+                }
+
+                stage('Image Scan') {
+                    steps {
+                        timeout(time: 10, unit: 'MINUTES') {
+                            script { scanImages() }
+                        }
+                    }
                 }
 
                 stage('Load Images into Minikube') {

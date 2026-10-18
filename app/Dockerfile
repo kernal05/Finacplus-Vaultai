@@ -10,6 +10,8 @@ COPY app/ .
 RUN npm run build
 
 FROM nginx:1.27-alpine
+# Pull in fixed OS packages (Trivy flags the base image's older ones)
+RUN apk upgrade --no-cache
 COPY --from=build /build/dist /usr/share/nginx/html
 COPY nginx/default.conf /etc/nginx/conf.d/default.conf
 EXPOSE 80

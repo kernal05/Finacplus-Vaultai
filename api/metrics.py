@@ -4,10 +4,10 @@
 # here instead of at main:app.
 
 import time
-from prometheus_client import Counter, Histogram
-from starlette.middleware.base import BaseHTTPMiddleware
 
 from main import app  # noqa: F401  (re-exported below)
+from prometheus_client import Counter, Histogram
+from starlette.middleware.base import BaseHTTPMiddleware
 
 REQUEST_COUNT = Counter(
     "vaultai_http_requests_total",

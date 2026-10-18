@@ -2,7 +2,7 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip pip install --user --default-timeout=120 --retries=10 -r requirements.txt
 
 FROM python:3.12-slim
 

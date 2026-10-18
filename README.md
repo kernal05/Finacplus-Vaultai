@@ -16,11 +16,14 @@ flowchart LR
   GH -->|webhook| J[Jenkins]
   J --> A[Checkout]
   subgraph Pipeline
-    A --> B[Build images] --> C[Load into Minikube] --> D[Staging: secret, deploy, smoke test] --> E{Approval}
+    A --> Q[Quality checks] --> B[Build images] --> I[Image scan] --> C[Load into Minikube] --> D[Staging: secret, deploy, smoke test] --> E{Approval}
     E --> F[Prod: secret, deploy, smoke test]
   end
   D --> S[(vaultai-staging)]
   F --> P[(vaultai-prod)]
+  M[Prometheus + Grafana] -.->|scrape| S
+  M -.->|scrape| P
+  M -.->|scrape| J
 ```
 
 Staging and prod are not separate branches. There is one `main` branch, and the differences between environments (namespace, replica count, resource limits) live in Kustomize overlays. I went this way so that what gets tested in staging is exactly what gets shipped, and so adding an environment means adding a folder instead of copying the pipeline.
@@ -36,6 +39,9 @@ k8s/base/                shared Deployments and Services
 k8s/overlays/staging/    namespace vaultai-staging, 2 replicas
 k8s/overlays/prod/       namespace vaultai-prod, 3 replicas, higher API limits
 jenkins/Dockerfile       Jenkins image with the docker CLI and kubectl added
+jenkins/install-ci-tools.sh  puts ruff and the Trivy database into the running Jenkins container
+monitoring/              in-cluster Prometheus + Grafana, port-forward services, memory fix
+ruff.toml                lint rules for the Quality Checks stage
 ```
 
 ## What you need
@@ -78,6 +84,18 @@ docker run -d --name jenkins --restart unless-stopped --network minikube \
 Plugins I used: Git, Pipeline, Multibranch Pipeline, Credentials Binding, Timestamper, Workspace Cleanup, and Blue Ocean for the nicer stage view.
 
 The `JAVA_OPTS` flag is explained in the webhook section below.
+
+### 2a. Tools for the quality stages
+
+The Quality Checks and Image Scan stages need `ruff` and `trivy` inside the Jenkins container. Install Trivy once (the installer script from the Trivy project; in a Dockerfile I would pin the release and verify its checksum instead), then let the script add ruff and the vulnerability database:
+
+```
+docker exec -u root jenkins sh -c "curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.71.2"
+trivy image --download-db-only          # on the host, once (about 130 MB, retry if it times out)
+bash jenkins/install-ci-tools.sh        # ruff binary (checksum-verified) + copies the Trivy database into Jenkins
+```
+
+The Trivy database is a snapshot, so it gets stale; rerun the last two commands to refresh it. These tools are installed into the running container rather than baked into `jenkins/Dockerfile`, which I would change before relying on this beyond a demo.
 
 ### 3. Credentials
 
@@ -132,13 +150,15 @@ On a real server with a public address, GitHub would call Jenkins directly and n
 ## What the pipeline does
 
 1. **Checkout.** Gets the commit and builds an image tag like `build-16-1f682e4` (build number plus short commit), so any running pod can be traced back to a commit.
-2. **Build images.** Builds the API and web images.
-3. **Load images into Minikube.** Copies the images into the cluster node. This stands in for pushing to a registry and takes about three minutes, which is the slowest part of the pipeline.
-4. **Sync staging secret.** Creates or updates the Kubernetes Secret before the deploy, so new pods start with the current value.
-5. **Deploy staging.** Applies the staging overlay, sets the new images and waits for the rollout. If the rollout doesn't finish in 180 seconds, it runs `kubectl rollout undo` on every component and fails the build.
-6. **Staging smoke test.** Runs the health endpoints from inside the API and web pods.
-7. **Approve production.** Waits up to 30 minutes for a person to choose. The default option is "Skip production (staging only)". This step doesn't hold a Jenkins executor while it waits.
-8. **Production stages.** Same secret, deploy and smoke test steps against the prod overlay, using the image that was already tested in staging.
+2. **Quality checks.** Runs `ruff check` on the API code and renders both Kustomize overlays, so a lint error or a broken manifest fails the build before any image is built.
+3. **Build images.** Builds the API and web images.
+4. **Image scan.** Trivy lists the HIGH and CRITICAL vulnerabilities that have a fix available, for each image. It is report-only at the moment; setting `SCAN_ENFORCE_CRITICAL = 'true'` in the Jenkinsfile makes fixable CRITICAL findings fail the build.
+5. **Load images into Minikube.** Copies the images into the cluster node. This stands in for pushing to a registry and takes about three minutes, which is the slowest part of the pipeline.
+6. **Sync staging secret.** Creates or updates the Kubernetes Secret before the deploy, so new pods start with the current value.
+7. **Deploy staging.** Applies the staging overlay with this build's image tags pinned into it, and waits for the rollout. If the rollout doesn't finish in 180 seconds, it runs `kubectl rollout undo` on every component and fails the build.
+8. **Staging smoke test.** Runs the health endpoints from inside the API and web pods.
+9. **Approve production.** Waits up to 30 minutes for a person to choose. The default option is "Skip production (staging only)". This step doesn't hold a Jenkins executor while it waits.
+10. **Production stages.** Same secret, deploy and smoke test steps against the prod overlay, using the image that was already tested in staging.
 
 If a new push arrives while a build is sitting at the approval step, the old build is aborted and replaced (`abortPrevious`). Without that, a forgotten approval would block every later build.
 
@@ -152,13 +172,30 @@ The repo-specific parts are in two functions at the top of the Jenkinsfile.
 
 If this were used across many repos, I would move the helper functions into a Jenkins Shared Library and keep only these two config functions in each repo's Jenkinsfile. I haven't done that here.
 
+## Quality checks and image scanning
+
+Two stages run on every branch, before anything is deployed:
+
+| Stage | What it does | Fails the build when |
+|---|---|---|
+| Quality Checks | `ruff check api/` (rules in `ruff.toml`), and `kubectl kustomize` for the staging and prod overlays | the code has lint errors or an overlay no longer renders |
+| Image Scan | Trivy scans both images for vulnerabilities that have a fix available | never today (report only); with `SCAN_ENFORCE_CRITICAL = 'true'`, when a fixable CRITICAL finding exists |
+
+Dependencies in `api/requirements.txt` are pinned to exact versions, so two builds of the same commit install the same packages.
+
+**Known issues.**
+- Trivy reports HIGH and CRITICAL findings in the OS packages of the base images (Debian for the API, Alpine for the web image). The fix is a newer base image. The web image runs `apk upgrade` to pick up fixed packages; the API image does not do this yet. The findings for each build are in its console log.
+- The scan is report-only because enforcing it on day one would block deploys on findings I haven't triaged. Turning it on is a one-line change.
+- Trivy runs offline against a database copied into Jenkins (the download is slow on this connection), so it can be out of date.
+- There is no automated test suite for the application itself. The checks above, the manifest rendering and the smoke tests after each deploy are what guard a release.
+
 ## Security notes
 
 What is already in place:
 
 - No credentials in the code or the git history. `git grep "sk-ant"` and `git log -S"sk-ant"` both return nothing.
 - Secrets reach the pipeline through Jenkins credentials and are masked in logs.
-- Production needs a manual approval, and `PROD_APPROVERS` in the Jenkinsfile can restrict who can give it. It is empty at the moment, so anyone who can run the build can approve. It should be set to real user IDs before this is used for anything real.
+- Production needs a manual approval, and only the Jenkins users or groups listed in `PROD_APPROVERS` in the Jenkinsfile can give it. Both environments still share the same Jenkins credentials, which is listed in the shortcuts table below.
 - Only `main` deploys. Other branches stop after building images.
 - The API container runs as a non-root user. All containers have resource limits and liveness and readiness probes.
 
@@ -168,7 +205,7 @@ Shortcuts I took because this runs locally, and what I'd do instead:
 |---|---|
 | Staging and prod use the same kubeconfig and API key credential | Separate credentials per environment, with RBAC limited to that namespace. In the Jenkinsfile this is only a change of two credential IDs in `envConfig()`. |
 | Webhook endpoint is open to unauthenticated calls (rescan only) | Public HTTPS Jenkins with a notifyCommit token or a signed GitHub webhook |
-| Images are loaded straight into Minikube | Push to a private registry with fixed tags, and scan images (for example with Trivy) before deploying |
+| Images are loaded straight into Minikube | Push to a private registry with fixed tags, and make the Trivy scan block the build on fixable CRITICAL findings (it is report-only here) |
 | Docker socket is mounted into Jenkins | Throwaway build agents such as Kubernetes agents or Kaniko |
 
 ## How I tested it
