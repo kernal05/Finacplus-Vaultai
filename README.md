@@ -1,109 +1,202 @@
-# VaultAI: GitOps with Argo CD and per-PR preview environments
+# VaultAI CI/CD Pipeline (Git, Jenkins, Kubernetes)
 
-A FastAPI + React app (with Postgres) deployed to a local Kubernetes cluster (minikube) using **Argo CD**. Git is the source of truth for the cluster, and every open pull request automatically gets its own isolated preview environment, which is deleted when the PR is closed.
+This repo has a Jenkins pipeline that builds and deploys the VaultAI app whenever code is pushed to GitHub. A push to `main` builds the API and web images, deploys them to a staging namespace on Kubernetes, runs a quick health check, and then waits for someone to approve the release. If it is approved, the same images go to production. Nothing is rebuilt for prod.
 
-## What this demonstrates
+I built and tested all of this on a local Minikube cluster, so a few things (the webhook tunnel, loading images straight into Minikube) are local-dev workarounds. I've listed them in the security section so it's clear what I would change in a real setup.
 
-- **GitOps deployment:** a push to `main` changes the cluster, with no `kubectl apply` by hand.
-- **Self-healing:** manual changes to the cluster are reverted to match Git.
-- **Ephemeral preview environments:** an Argo CD **ApplicationSet with the Pull Request generator** creates one namespace per open PR and removes it when the PR closes.
-- **One Helm chart, many environments:** the same chart serves `dev` and every PR preview.
+## How it fits together
 
-## Architecture
+![Architecture diagram](docs/architecture.png)
+
+The same flow as a diagram that GitHub renders from text:
 
 ```mermaid
 flowchart LR
-    Dev[Developer] -->|push / open PR| GH[(GitHub repo)]
-    GH -->|watched every ~120s| AS[ApplicationSet<br/>PR generator]
-    GH -->|main branch| APP[Application<br/>vaultai-dev]
-    AS -->|one Application per open PR| PR[Application<br/>vaultai-pr-N]
-    APP --> NSD[namespace vaultai-dev]
-    PR --> NSP[namespace vaultai-pr-N]
-    subgraph Each namespace
-        GW[gateway] -->|/api| API[api - FastAPI]
-        GW -->|everything else| FE[frontend - nginx]
-        API --> DB[(postgres)]
-    end
-    NSD --- GW
-    NSP --- GW
+  Dev[Developer] -->|git push| GH[GitHub]
+  GH -->|webhook| J[Jenkins]
+  J --> A[Checkout]
+  subgraph Pipeline
+    A --> B[Build images] --> C[Load into Minikube] --> D[Staging: secret, deploy, smoke test] --> E{Approval}
+    E --> F[Prod: secret, deploy, smoke test]
+  end
+  D --> S[(vaultai-staging)]
+  F --> P[(vaultai-prod)]
 ```
 
-Each environment runs four pods: **gateway** (routes `/api` to the API and everything else to the frontend), **frontend**, **api** and **postgres**.
+Staging and prod are not separate branches. There is one `main` branch, and the differences between environments (namespace, replica count, resource limits) live in Kustomize overlays. I went this way so that what gets tested in staging is exactly what gets shipped, and so adding an environment means adding a folder instead of copying the pipeline.
 
-## Repo layout
+## What's in the repo
 
 ```
-charts/vaultai-preview/     Helm chart used by every environment
-gitops/
-  application-dev.yaml          Application for the long-lived dev environment (tracks main)
-  applicationset-pr-previews.yaml   ApplicationSet + PR generator (one app per open PR)
-  appproject-previews.yaml      AppProject that scopes what previews may deploy
-scripts/                    Numbered helper scripts (build, install, demo, teardown)
-docs/                       Supporting notes
+Jenkinsfile              the pipeline (Declarative, with Groovy helper functions)
+api/Dockerfile           API image (Python)
+app/Dockerfile           web image (Node build, served by nginx)
+nginx/default.conf       nginx config, including the API proxy
+k8s/base/                shared Deployments and Services
+k8s/overlays/staging/    namespace vaultai-staging, 2 replicas
+k8s/overlays/prod/       namespace vaultai-prod, 3 replicas, higher API limits
+jenkins/Dockerfile       Jenkins image with the docker CLI and kubectl added
 ```
 
-## How it works
+## What you need
 
-**Dev environment.** `application-dev.yaml` points Argo CD at `charts/vaultai-preview` on `main`, with automated sync (`prune: true`, `selfHeal: true`). Anything merged to `main` is applied automatically.
+- Docker, kubectl and a running Minikube cluster
+- A GitHub repo with this code, plus a personal access token that can read it
+- Node.js and npm on the host, only for the webhook forwarder
 
-**PR previews.** `applicationset-pr-previews.yaml` uses the Pull Request generator. Argo CD polls GitHub for open PRs, generates an Application for each one, and deploys the chart into a namespace named `vaultai-pr-<number>`. When the PR is closed, the Application is pruned and the namespace is deleted with it.
+## Setup
 
-## Run it locally
-
-Prerequisites: Docker, minikube, kubectl, git. About 4 GB of free RAM is enough for dev plus one preview. Update the repository URL in `gitops/*.yaml` to your own fork before running.
+### 1. Kubernetes
 
 ```bash
-./scripts/30-all-in-one.sh
+kubectl create namespace vaultai-staging
+kubectl create namespace vaultai-prod
+
+# check that both overlays render before applying anything
+kubectl kustomize k8s/overlays/staging
+kubectl kustomize k8s/overlays/prod
 ```
 
-This checks tools, starts minikube, builds the images inside minikube, pushes the chart to GitHub, installs Argo CD and deploys the dev app. It is safe to re-run. Add `--previews` to also set up PR previews (needs a GitHub fine-grained token with read access to Contents and Pull requests).
+### 2. Jenkins
 
-Then open each in its own terminal (they are `kubectl port-forward` tunnels):
+The pipeline needs `docker` and `kubectl` inside the Jenkins container, which the stock image doesn't have. `jenkins/Dockerfile` adds them.
 
 ```bash
-./scripts/22-argocd-ui.sh            # Argo CD UI  -> https://localhost:8080
-./scripts/26-preview-open.sh dev     # dev app     -> http://localhost:9000
-./scripts/26-preview-open.sh 1 9001  # PR #1       -> http://localhost:9001
+docker build -t jenkins-custom:latest jenkins/
+
+docker run -d --name jenkins --restart unless-stopped --network minikube \
+  -p 8090:8080 \
+  -v jenkins_home:/var/jenkins_home \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v $HOME/.minikube:$HOME/.minikube \
+  -v $HOME/.kube:/root/.kube \
+  -e MINIKUBE_HOME=$HOME/.minikube \
+  -e JAVA_OPTS="-Xmx512m -Xms256m -Dhudson.plugins.git.GitStatus.NOTIFY_COMMIT_ACCESS_CONTROL=disabled-for-polling" \
+  jenkins-custom:latest
 ```
 
-| Script | Purpose |
+Plugins I used: Git, Pipeline, Multibranch Pipeline, Credentials Binding, Timestamper, Workspace Cleanup, and Blue Ocean for the nicer stage view.
+
+The `JAVA_OPTS` flag is explained in the webhook section below.
+
+### 3. Credentials
+
+Add these under Manage Jenkins, Credentials:
+
+| ID | Type | Used for |
+|---|---|---|
+| `github-token` | Username and password (PAT) | reading the repo |
+| `minikube-kubeconfig` | Secret file | kubectl access to the cluster |
+| `vaultai-anthropic-key` | Secret text | the app's API key, which the pipeline puts into a Kubernetes Secret |
+
+None of these are in the repo or in the build logs. Jenkins masks them when they are used.
+
+### 4. The Jenkins job
+
+Create a Multibranch Pipeline job, point it at the GitHub repo with the `github-token` credential, and leave the script path as `Jenkinsfile`. Every branch gets built, but only `main` deploys. That branch name is set in `appConfig()` at the top of the Jenkinsfile.
+
+### 5. Triggering builds on push
+
+Jenkins runs on localhost, so GitHub can't call it directly. I used [smee.io](https://smee.io), which is a common way to get around this in local development.
+
+1. Create a channel on smee.io, then add a webhook in the GitHub repo settings. Use the smee URL as the payload URL, `application/json` as the content type, and send only push events.
+2. Run the forwarder as a systemd service so it keeps going after the terminal is closed:
+
+```bash
+sudo tee /etc/systemd/system/smee-jenkins.service > /dev/null << 'EOF'
+[Unit]
+Description=smee.io webhook forwarder for Jenkins
+After=network.target docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/npx --yes smee-client --url https://smee.io/<your-channel> --target http://localhost:8090/git/notifyCommit?url=https://github.com/<owner>/<repo>
+Restart=always
+RestartSec=5
+User=<your-user>
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now smee-jenkins
+```
+
+3. By default the Git plugin answers `401 An access token is required` to calls like this. The Jenkins version I used didn't show a place to create a notifyCommit token, so I set `NOTIFY_COMMIT_ACCESS_CONTROL=disabled-for-polling` in `JAVA_OPTS` instead. All that does is let the endpoint ask Jenkins to rescan the repo. It can't run anything else.
+
+The job also scans the repo every minute, so if the webhook path is down (for example the laptop was asleep), the push is still picked up a little later.
+
+On a real server with a public address, GitHub would call Jenkins directly and none of the smee setup would be needed.
+
+## What the pipeline does
+
+1. **Checkout.** Gets the commit and builds an image tag like `build-16-1f682e4` (build number plus short commit), so any running pod can be traced back to a commit.
+2. **Build images.** Builds the API and web images.
+3. **Load images into Minikube.** Copies the images into the cluster node. This stands in for pushing to a registry and takes about three minutes, which is the slowest part of the pipeline.
+4. **Sync staging secret.** Creates or updates the Kubernetes Secret before the deploy, so new pods start with the current value.
+5. **Deploy staging.** Applies the staging overlay, sets the new images and waits for the rollout. If the rollout doesn't finish in 180 seconds, it runs `kubectl rollout undo` on every component and fails the build.
+6. **Staging smoke test.** Runs the health endpoints from inside the API and web pods.
+7. **Approve production.** Waits up to 30 minutes for a person to choose. The default option is "Skip production (staging only)". This step doesn't hold a Jenkins executor while it waits.
+8. **Production stages.** Same secret, deploy and smoke test steps against the prod overlay, using the image that was already tested in staging.
+
+If a new push arrives while a build is sitting at the approval step, the old build is aborted and replaced (`abortPrevious`). Without that, a forgotten approval would block every later build.
+
+## Using it for other repos or clusters
+
+The repo-specific parts are in two functions at the top of the Jenkinsfile.
+
+`appConfig()` lists the components to build and deploy: deployment name, container, image name, Dockerfile, build context and smoke test command. It also holds the secret name and which branch deploys. To onboard another service, add another entry to the list.
+
+`envConfig()` lists the environments: namespace, overlay folder, and the Jenkins credential IDs for the kubeconfig and the API key. To add an environment or point at a different cluster, add an entry, create a credential, and add a `k8s/overlays/<name>` folder.
+
+If this were used across many repos, I would move the helper functions into a Jenkins Shared Library and keep only these two config functions in each repo's Jenkinsfile. I haven't done that here.
+
+## Security notes
+
+What is already in place:
+
+- No credentials in the code or the git history. `git grep "sk-ant"` and `git log -S"sk-ant"` both return nothing.
+- Secrets reach the pipeline through Jenkins credentials and are masked in logs.
+- Production needs a manual approval, and `PROD_APPROVERS` in the Jenkinsfile can restrict who can give it. It is empty at the moment, so anyone who can run the build can approve. It should be set to real user IDs before this is used for anything real.
+- Only `main` deploys. Other branches stop after building images.
+- The API container runs as a non-root user. All containers have resource limits and liveness and readiness probes.
+
+Shortcuts I took because this runs locally, and what I'd do instead:
+
+| Shortcut | What I'd do in a real setup |
 |---|---|
-| `10-minikube-build.sh` | Build the two images inside minikube |
-| `20-preflight.sh` | Check the environment before installing |
-| `21-argocd-install.sh` | Install Argo CD |
-| `22-argocd-ui.sh` | Port-forward the Argo CD UI |
-| `23-argocd-github-token.sh` | Store the GitHub token for the PR generator |
-| `24-argocd-apply.sh` | Apply the dev app / ApplicationSet |
-| `25-demo-pr.sh` | Push a demo branch to try a preview |
-| `26-preview-open.sh` | Port-forward an environment's gateway |
-| `27-argocd-teardown.sh` | Remove Argo CD and the environments |
+| Staging and prod use the same kubeconfig and API key credential | Separate credentials per environment, with RBAC limited to that namespace. In the Jenkinsfile this is only a change of two credential IDs in `envConfig()`. |
+| Webhook endpoint is open to unauthenticated calls (rescan only) | Public HTTPS Jenkins with a notifyCommit token or a signed GitHub webhook |
+| Images are loaded straight into Minikube | Push to a private registry with fixed tags, and scan images (for example with Trivy) before deploying |
+| Docker socket is mounted into Jenkins | Throwaway build agents such as Kubernetes agents or Kaniko |
 
-## Verified behaviour
+## How I tested it
 
-| Test | Result |
-|---|---|
-| Deploy dev app via Argo CD | `Synced` / `Healthy`, 4 pods running |
-| `kubectl scale deploy/api --replicas=3` (manual drift) | Argo CD reverted it to 1 within seconds (self-heal) |
-| Change `api.replicas` to 2 in `values.yaml`, push to `main` | Second API pod created automatically |
-| Revert the change through Git | Extra pod removed automatically (prune) |
-| Open a pull request | `vaultai-pr-1` namespace with its own 4 pods created |
-| Close the pull request | Namespace and all its resources deleted automatically |
+- **Manifests:** `kubectl kustomize k8s/overlays/staging` and `.../prod` show the right namespace, replica count and limits.
+- **Webhook:** pushed a commit and watched `journalctl -u smee-jenkins -f`. It showed `POST ... - 200` and a build started right away.
+- **Smoke tests:** the API returns `{"status":"ok","service":"vaultai-api"}` and the web pod returns `ok`, in both environments.
+- **Full promotion (build 16):** staging, approval, then the same image tag in prod with 3 replicas each.
+- **Rollback (build 17):** I changed the API readiness probe path from `/healthz` to `/nope` and pushed. The new pod never became ready, the rollout hit the 180 second timeout, the pipeline ran the rollback and failed with "rolled back automatically", and production was never reached. Old pods kept serving the whole time.
+- **Recovery (build 18):** reverted the change, and the next build went through normally.
 
-## Screenshots
+To repeat the rollback test, break the probe path in `k8s/base/api-deployment.yaml`, push, and revert once the build has failed. Wait for the failed build to finish before pushing the revert, because a new push aborts a running build.
 
-Add screenshots here: the Argo CD application tree, the self-heal test, and PR #1 with its preview namespace.
+## Monitoring and logging ideas
 
-## Known limitations and next steps
+I haven't set these up, but this is what I would add next:
 
-- **Previews use the `:local` image tag.** All environments run the same images built inside minikube, so a preview does not reflect code changes on the PR branch. A production setup builds one image per commit in CI, pushes it to a registry, and passes the tag (for example the PR head SHA) into the chart through the ApplicationSet template.
-- **No External Secrets Operator yet.** Secrets are not synced from an external store such as Vault or AWS Secrets Manager. That would be the way to give each preview its own credentials without putting them in Git.
-- **No per-preview observability.** Logs and metrics are not labelled or dashboarded per PR.
-- **Closing a PR was tested, merging was not.** Both remove the PR from the generator's list, so the teardown mechanism is the same.
-- **PR detection polls about every 2 minutes.** A GitHub webhook to Argo CD would make it near-instant.
-- **App-of-Apps** is not used. The dev Application and the ApplicationSet are applied directly by script.
+- **Pipeline health.** The Jenkins Prometheus Metrics plugin with Grafana for build duration, success rate and queue time, and an alert after several failed builds in a row.
+- **Notifications.** A Slack or email message on failure, and another when a build is waiting for production approval.
+- **Cluster health.** kube-state-metrics with Prometheus, with alerts for unavailable replicas, crash-looping pods and failed rollouts.
+- **Application logs.** Send container logs to Loki or an EFK stack. For now, `kubectl logs deploy/<name> -n <namespace>` works.
+- **Audit trail.** The approval step records who approved a release in the build log, and Jenkins keeps the last 20 builds.
+- **Speed.** Replacing the Minikube image load with a registry push would remove about three minutes per build.
 
-## Teardown
+## Troubleshooting
 
-```bash
-./scripts/27-argocd-teardown.sh
-```
+- **Webhook returns 401.** The Git plugin wants a notifyCommit token. Either create one or use the `JAVA_OPTS` flag from step 2.
+- **"No git jobs using repository" in the webhook response.** Normal for a multibranch job. It still schedules a branch scan.
+- **Rollout times out.** Look at `kubectl describe pod` and check the probe paths. The pipeline will already have rolled back.
+- **`ErrImagePull` in a pod.** The image wasn't loaded into Minikube. Check the "Load Images into Minikube" stage.
+- **A running build disappears after a new push.** That's the `abortPrevious` setting doing its job.
