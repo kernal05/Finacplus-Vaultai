@@ -16,8 +16,8 @@ app = FastAPI(title="VaultAI API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten to real frontend origin before real prod use
-    allow_methods=["*"],
+    allow_origins=os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:8081").split(","),
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 

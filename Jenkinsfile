@@ -101,6 +101,21 @@ def syncSecret(String envName) {
 }
 
 // Apply overlay, roll to this build's images, roll back automatically on failure.
+def rollbackEnv(String envName) {
+    def cfg = envConfig(envName)
+    def comps = appConfig().components
+    withEnv(["NS=${cfg.ns}"]) {
+        withCredentials([file(credentialsId: cfg.kubeCred, variable: 'KUBECONFIG')]) {
+            echo "Rolling back every component in ${cfg.ns} to its previous revision"
+            for (c in comps) {
+                withEnv(["DEPLOY=${c.deployment}"]) {
+                    sh 'kubectl rollout undo "deployment/$DEPLOY" -n "$NS" --kubeconfig="$KUBECONFIG" || true'
+                }
+            }
+        }
+    }
+}
+
 def deployEnv(String envName) {
     def cfg = envConfig(envName)
     def comps = appConfig().components
@@ -133,12 +148,7 @@ def deployEnv(String envName) {
             }
 
             if (!ok) {
-                echo "Rollout failed in ${cfg.ns}: rolling back every component to its previous revision"
-                for (c in comps) {
-                    withEnv(["DEPLOY=${c.deployment}"]) {
-                        sh 'kubectl rollout undo "deployment/$DEPLOY" -n "$NS" --kubeconfig="$KUBECONFIG" || true'
-                    }
-                }
+                rollbackEnv(envName)
                 error "Rollout failed in ${cfg.ns}; rolled back automatically."
             }
         }
@@ -175,7 +185,7 @@ pipeline {
     environment {
         // Comma-separated Jenkins user IDs/groups allowed to approve prod.
         // Empty = any user who can build. Set this before real use.
-        PROD_APPROVERS = ''
+        PROD_APPROVERS = 'devops-admin'
     }
 
     stages {
@@ -216,7 +226,17 @@ pipeline {
 
                 stage('Staging Smoke Test') {
                     when { expression { env.BRANCH_NAME == appConfig().deployBranch } }
-                    steps { script { smokeTest('staging') } }
+                    steps {
+                        script {
+                            try {
+                                smokeTest('staging')
+                            } catch (e) {
+                                echo "Staging smoke test failed: ${e.getMessage()}"
+                                rollbackEnv('staging')
+                                error "Staging smoke test failed; rolled back automatically. Production was not touched."
+                            }
+                        }
+                    }
                 }
             }
             post {
@@ -265,7 +285,17 @@ pipeline {
                     steps { script { deployEnv('prod') } }
                 }
                 stage('Production Smoke Test') {
-                    steps { script { smokeTest('prod') } }
+                    steps {
+                        script {
+                            try {
+                                smokeTest('prod')
+                            } catch (e) {
+                                echo "Production smoke test failed: ${e.getMessage()}"
+                                rollbackEnv('prod')
+                                error "Production smoke test failed; rolled back automatically."
+                            }
+                        }
+                    }
                 }
             }
             post {
