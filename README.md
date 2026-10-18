@@ -104,8 +104,11 @@ Add these under Manage Jenkins, Credentials:
 | ID | Type | Used for |
 |---|---|---|
 | `github-token` | Username and password (PAT) | reading the repo |
-| `minikube-kubeconfig` | Secret file | kubectl access to the cluster |
+| `kubeconfig-staging` | Secret file | kubectl access to `vaultai-staging` only, via a namespace-scoped ServiceAccount (RBAC Role limited to deployments/services/secrets/pods-exec in that namespace) |
+| `kubeconfig-prod` | Secret file | kubectl access to `vaultai-prod` only, same RBAC scoping, completely separate token from staging |
 | `vaultai-anthropic-key` | Secret text | the app's API key, which the pipeline puts into a Kubernetes Secret |
+
+`minikube-kubeconfig` (cluster-admin) is kept only for one-time manual setup (namespaces, the RBAC objects themselves). The pipeline itself never uses it.
 
 None of these are in the repo or in the build logs. Jenkins masks them when they are used.
 
@@ -203,7 +206,6 @@ Shortcuts I took because this runs locally, and what I'd do instead:
 
 | Shortcut | What I'd do in a real setup |
 |---|---|
-| Staging and prod use the same kubeconfig and API key credential | Separate credentials per environment, with RBAC limited to that namespace. In the Jenkinsfile this is only a change of two credential IDs in `envConfig()`. |
 | Webhook endpoint is open to unauthenticated calls (rescan only) | Public HTTPS Jenkins with a notifyCommit token or a signed GitHub webhook |
 | Images are loaded straight into Minikube | Push to a private registry with fixed tags, and make the Trivy scan block the build on fixable CRITICAL findings (it is report-only here) |
 | Docker socket is mounted into Jenkins | Throwaway build agents such as Kubernetes agents or Kaniko |
