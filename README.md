@@ -281,7 +281,3 @@ Trivy scans both images after they are built. It lists only findings that alread
 | vaultai-api | 1 HIGH, 0 critical: libpcre2-8-0 (CVE-2026-103111), fixed in 10.46-1~deb13u3. All Python dependencies scanned clean. |
 
 Next step for the API image: run `apt-get upgrade` in its Dockerfile, as the web image does with `apk upgrade`. Once both images scan clean, `SCAN_ENFORCE_CRITICAL` can be switched to `'true'`.
-
-## Why not SonarQube
-
-Trivy checks images and dependencies for known vulnerabilities. SonarQube analyses the source code itself. I used ruff for code linting instead, because SonarQube needs its own server and a few GB of memory, which this local cluster doesn't have. In a larger setup I would add it, with a quality gate on the pipeline.
