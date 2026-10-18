@@ -299,3 +299,85 @@ Prometheus evaluates the alert rules and sends firing alerts to Alertmanager, wh
 - Each container has startup, readiness and liveness probes with 5 second timeouts.
 - The pipeline waits up to 300 seconds for each rollout and runs `kubectl rollout undo` automatically if it fails. Staging runs 1 replica per service and prod runs 3, to suit the small local cluster.
 - Quality gates: `ruff`, a non-blocking `pip-audit` (120 second cap), manifest validation with `kubectl kustomize`, and a Trivy image scan.
+
+## Deploying to AWS or GCP instead of Minikube
+
+The pipeline is written so that moving to a managed cluster changes the credentials and the image step, not the pipeline logic. Everything else (Kustomize overlays, rollout checks, smoke tests, approval gate, rollback) stays the same.
+
+### What changes
+
+| Local (Minikube) | AWS | GCP |
+|---|---|---|
+| Images loaded with `docker save` and `docker load` | Push to Amazon ECR | Push to Artifact Registry |
+| Cluster is Minikube | Amazon EKS | Google GKE |
+| Jenkins credential is a namespace-scoped kubeconfig | Same, with the token of a namespace-scoped ServiceAccount | Same |
+| Secret `vaultai-secrets` created by the pipeline | Optionally sync from AWS Secrets Manager | Optionally sync from Secret Manager |
+| Webhook forwarded through smee.io | GitHub calls Jenkins directly (public HTTPS URL) | Same |
+| Services reached with port-forward | LoadBalancer or Ingress (ALB controller) | LoadBalancer or Ingress (GCE) |
+
+### Steps
+
+1. **Create the registry and push images.** Replace the "Load Images into Minikube" stage with a push stage.
+
+   AWS:
+```bash
+   aws ecr create-repository --repository-name vaultai-api
+   aws ecr create-repository --repository-name vaultai-web
+   aws ecr get-login-password --region <region> | docker login --username AWS --password-stdin <account>.dkr.ecr.<region>.amazonaws.com
+   docker tag vaultai-api:$TAG <account>.dkr.ecr.<region>.amazonaws.com/vaultai-api:$TAG
+   docker push <account>.dkr.ecr.<region>.amazonaws.com/vaultai-api:$TAG
+```
+
+   GCP:
+```bash
+   gcloud artifacts repositories create vaultai --repository-format=docker --location=<region>
+   gcloud auth configure-docker <region>-docker.pkg.dev
+   docker tag vaultai-api:$TAG <region>-docker.pkg.dev/<project>/vaultai/vaultai-api:$TAG
+   docker push <region>-docker.pkg.dev/<project>/vaultai/vaultai-api:$TAG
+```
+
+2. **Point the image pins at the registry.** The pipeline already generates `image-pins.yaml` per build. Use the full registry path in it, and set `imagePullPolicy: IfNotPresent` or `Always`. Give the cluster permission to pull (EKS node role with ECR read access, or GKE node service account with Artifact Registry Reader).
+
+3. **Create the cluster and a restricted deployer identity.**
+
+   AWS:
+```bash
+   eksctl create cluster --name vaultai --region <region> --nodes 2
+   aws eks update-kubeconfig --name vaultai --region <region>
+```
+
+   GCP:
+```bash
+   gcloud container clusters create vaultai --region <region> --num-nodes 2
+   gcloud container clusters get-credentials vaultai --region <region>
+```
+
+   Then apply `k8s/rbac/rbac-staging.yaml` and `k8s/rbac/rbac-prod.yaml` (the namespace-scoped Roles used here) and build one kubeconfig per environment from the `jenkins-deployer` ServiceAccount token. Store each in Jenkins as a Secret File credential. Do not give Jenkins cluster-admin.
+
+4. **Use separate clusters or namespaces per environment.** For a stronger split, create one cluster for staging and one for prod, then store a different kubeconfig credential for each. `deployEnv()` only needs a namespace and a credential ID, so no pipeline logic changes.
+
+5. **Run Jenkins where GitHub can reach it.** Put it on a VM or in the cluster behind HTTPS. Remove smee.io and add a normal GitHub webhook pointing at `https://<jenkins-host>/github-webhook/` (or the `notifyCommit` URL with an access token). Re-enable the Git plugin's access control.
+
+6. **Secrets.** Keep secret values in Jenkins credentials or the cloud secret manager. Never put them in the repository or in ConfigMaps.
+
+7. **Monitoring.** Run Prometheus and Alertmanager in the cluster, or use Amazon Managed Prometheus or Google Managed Service for Prometheus. The alert rules and Grafana dashboard carry over unchanged.
+
+### Adding another repository or cluster
+
+- **New repository:** add it as another multibranch pipeline or GitHub organization folder in Jenkins. Each repository brings its own `Jenkinsfile` and `k8s/` overlays.
+- **New cluster or environment:** add an overlay under `k8s/overlays/<name>/`, a namespace-scoped RBAC manifest, and a Jenkins kubeconfig credential, then add one entry to the environments list in the `Jenkinsfile`.
+
+## Evidence
+
+| What it shows | Screenshot |
+|---|---|
+| Green pipeline (build #32): staging, manual approval, production | ![build](docs/screenshots/01-jenkins-build-32-green.png) |
+| Push-triggered build via the smee.io webhook | ![webhook](docs/screenshots/02-github-webhook-delivery.png) |
+| Trivy image scan with 0 fixable HIGH or CRITICAL findings | ![scan](docs/screenshots/03-image-scan-zero-findings.png) |
+| Pods running in staging, prod and monitoring | ![pods](docs/screenshots/04-pods-staging-prod-monitoring.png) |
+| Grafana dashboard | ![grafana](docs/screenshots/05-grafana-dashboard.png) |
+| Alert firing email (prod API scaled to 0) | ![firing](docs/screenshots/06-alert-firing-email.png) |
+| Alert resolved email | ![resolved](docs/screenshots/07-alert-resolved-email.png) |
+| Prometheus targets | ![prometheus](docs/screenshots/08-prometheus-targets.png) |
+
+Note: on the 4.8 GB local machine a full run takes about 30 minutes, mostly building images and loading them into Minikube. A managed cluster with a registry removes the slow load step.
