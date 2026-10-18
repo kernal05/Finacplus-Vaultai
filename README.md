@@ -110,10 +110,10 @@ After=network.target docker.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/npx --yes smee-client --url https://smee.io/<your-channel> --target http://localhost:8090/git/notifyCommit?url=https://github.com/<owner>/<repo>
+ExecStart=/usr/bin/npx --yes smee-client --url https://smee.io/<your-channel> --target http://localhost:8090/git/notifyCommit?url=https://github.com/kernal05/Finacplus-Vaultai
 Restart=always
 RestartSec=5
-User=<your-user>
+User=vishal
 
 [Install]
 WantedBy=multi-user.target
