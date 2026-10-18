@@ -104,22 +104,30 @@ def syncSecret(String envName) {
 def deployEnv(String envName) {
     def cfg = envConfig(envName)
     def comps = appConfig().components
+
+    // Pin this build's tags in the workspace copy of the overlay (never committed),
+    // so ONE apply deploys the right image and rollback goes to the previous real build.
+    String pins = "\nimages:\n"
+    for (c in comps) {
+        pins += "  - name: ${c.image}\n    newTag: ${env.IMAGE_TAG}\n"
+    }
+    writeFile file: 'image-pins.yaml', text: pins
+
     withEnv(["NS=${cfg.ns}", "OVERLAY=${cfg.overlay}"]) {
         withCredentials([file(credentialsId: cfg.kubeCred, variable: 'KUBECONFIG')]) {
-            sh 'set -e; kubectl apply -k "$OVERLAY" --kubeconfig="$KUBECONFIG"'
-
-            for (c in comps) {
-                withEnv(["DEPLOY=${c.deployment}", "CONTAINER=${c.container}", "IMG=${imageRef(c)}"]) {
-                    sh 'set -e; kubectl set image "deployment/$DEPLOY" "$CONTAINER=$IMG" -n "$NS" --kubeconfig="$KUBECONFIG"'
-                }
-            }
+            sh '''
+                set -e
+                kubectl get nodes --request-timeout=20s --kubeconfig="$KUBECONFIG"
+                cat image-pins.yaml >> "$OVERLAY/kustomization.yaml"
+                kubectl apply -k "$OVERLAY" --kubeconfig="$KUBECONFIG"
+            '''
 
             boolean ok = true
             for (c in comps) {
                 if (!ok) { break }
                 withEnv(["DEPLOY=${c.deployment}"]) {
                     int rc = sh(returnStatus: true,
-                                script: 'kubectl rollout status "deployment/$DEPLOY" -n "$NS" --kubeconfig="$KUBECONFIG" --timeout=180s')
+                                script: 'timeout 240 kubectl rollout status "deployment/$DEPLOY" -n "$NS" --kubeconfig="$KUBECONFIG" --timeout=180s')
                     if (rc != 0) { ok = false }
                 }
             }
