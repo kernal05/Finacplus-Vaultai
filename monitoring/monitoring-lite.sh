@@ -12,6 +12,7 @@ set -euo pipefail
 NS=monitoring
 PROM_IMG="prom/prometheus:v2.55.1"      # already on this machine from the old compose setup
 GRAF_IMG="grafana/grafana:11.2.0"       # same; the 13.x distroless image is 1.4 GB and was too slow
+AM_IMG="prom/alertmanager:v0.27.0"       # Alertmanager (email alerts)
 NODE=minikube
 
 if [ "${1:-}" = "--remove" ]; then
@@ -29,7 +30,7 @@ fi
 echo "minikube cap: $((cap/1024/1024)) MiB - ok"
 
 echo "== images (loaded from this machine's Docker into minikube; no big pulls inside the cluster) =="
-for img in "$PROM_IMG" "$GRAF_IMG"; do
+for img in "$PROM_IMG" "$GRAF_IMG" "$AM_IMG"; do
   docker image inspect "$img" >/dev/null 2>&1 || docker pull "$img"
   if docker exec "$NODE" docker image inspect "$img" >/dev/null 2>&1; then
     echo "already in minikube: $img"
@@ -52,6 +53,11 @@ cat > "$W/prometheus.yml" <<'EOF'
 global:
   scrape_interval: 30s
   evaluation_interval: 30s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager.monitoring.svc:9093']
 
 rule_files:
   - /etc/prometheus/alert_rules.yml
@@ -129,6 +135,13 @@ groups:
         annotations:
           summary: "Jenkins is not answering scrapes"
           description: "The CI server has been unreachable for 2 minutes - commits will not build."
+      - alert: VaultAIAPIMissing
+        expr: absent(up{job="vaultai-api", namespace="vaultai-prod"})
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "No VaultAI API pods are running in production"
+          description: "Prometheus sees no vaultai-api targets in vaultai-prod. The API is scaled to zero or crashing."
 EOF
 
 cat > "$W/datasource.yaml" <<'EOF'
@@ -380,8 +393,103 @@ spec:
   ports: [{name: web, port: 3000, targetPort: web}]
 EOF
 
+# ---- Alertmanager: email notifications (restricted Pod Security profile, SMTP password from a Secret) ----
+if ! kubectl -n "$NS" get secret alertmanager-smtp >/dev/null 2>&1; then
+  [ -t 0 ] || { echo "Secret alertmanager-smtp is missing. Run this script from a terminal to create it."; exit 1; }
+  read -r -p "Gmail address for alerts: " AM_ADDR
+  read -rsp "Gmail app password (16 characters, no spaces): " AM_PW; echo
+  kubectl -n "$NS" create secret generic alertmanager-smtp \
+    --from-literal=smtp_user="$AM_ADDR" --from-literal=smtp_password="$AM_PW"
+  unset AM_PW
+fi
+ADDR=$(kubectl -n "$NS" get secret alertmanager-smtp -o jsonpath='{.data.smtp_user}' | base64 -d)
+
+cat > "$W/alertmanager.yml" <<EOF
+global:
+  smtp_smarthost: 'smtp.gmail.com:587'
+  smtp_from: '${ADDR}'
+  smtp_auth_username: '${ADDR}'
+  smtp_auth_password_file: /etc/alertmanager-smtp/smtp_password
+  smtp_require_tls: true
+route:
+  receiver: email-alert
+  group_by: ['alertname']
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 1h
+receivers:
+  - name: email-alert
+    email_configs:
+      - to: '${ADDR}'
+        send_resolved: true
+EOF
+kubectl -n "$NS" create configmap alertmanager-config --from-file=alertmanager.yml="$W/alertmanager.yml" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl apply -f - <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: alertmanager, namespace: monitoring, labels: {app: alertmanager}}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: alertmanager}}
+  template:
+    metadata: {labels: {app: alertmanager}}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.27.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+          ports: [{name: web, containerPort: 9093}]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 150m, memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          readinessProbe:
+            httpGet: {path: /-/ready, port: web}
+            periodSeconds: 15
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: {path: /-/healthy, port: web}
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 5
+          volumeMounts:
+            - {name: config, mountPath: /etc/alertmanager, readOnly: true}
+            - {name: smtp-secret, mountPath: /etc/alertmanager-smtp, readOnly: true}
+            - {name: data, mountPath: /alertmanager}
+      volumes:
+        - {name: config, configMap: {name: alertmanager-config}}
+        - name: smtp-secret
+          secret:
+            secretName: alertmanager-smtp
+            items: [{key: smtp_password, path: smtp_password}]
+        - {name: data, emptyDir: {sizeLimit: 50Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: alertmanager, namespace: monitoring}
+spec:
+  selector: {app: alertmanager}
+  ports: [{name: web, port: 9093, targetPort: web}]
+EOF
+
 # Config files are read at start-up: restart so a re-run with new config takes effect.
-kubectl -n "$NS" rollout restart deployment/prometheus deployment/grafana >/dev/null
+kubectl -n "$NS" rollout restart deployment/prometheus deployment/grafana deployment/alertmanager >/dev/null
 
 echo "== waiting for pods =="
 if ! kubectl -n "$NS" rollout status deployment/prometheus --timeout=240s \

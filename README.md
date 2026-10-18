@@ -283,3 +283,19 @@ Trivy scans both images after they are built. It lists only findings that alread
 | vaultai-api | 1 HIGH, 0 critical: libpcre2-8-0 (CVE-2026-103111), fixed in 10.46-1~deb13u3. All Python dependencies scanned clean. |
 
 Next step for the API image: run `apt-get upgrade` in its Dockerfile, as the web image does with `apk upgrade`. Once both images scan clean, `SCAN_ENFORCE_CRITICAL` can be switched to `'true'`.
+
+## Alerting (Alertmanager, email)
+
+Prometheus evaluates the alert rules and sends firing alerts to Alertmanager, which emails them (and the resolved notice) through Gmail SMTP.
+
+- Alertmanager runs in the `monitoring` namespace under the `restricted` Pod Security profile: non-root, read-only root filesystem, all capabilities dropped, seccomp `RuntimeDefault`, with CPU and memory limits.
+- The SMTP app password is stored only in the Kubernetes Secret `alertmanager-smtp` and mounted as a read-only file. It is never in the repository or in a ConfigMap. `monitoring/monitoring-lite.sh` asks for it with hidden input the first time.
+- Alert rules: `VaultAIAPIDown`, `VaultAIHighErrorRate`, `VaultAIHighLatency`, `JenkinsDown`, and `VaultAIAPIMissing`. The last one fires when no API pods exist in `vaultai-prod`, which catches the case where the API is scaled to zero.
+- Verification: the prod API was scaled to 0 and `VaultAIAPIMissing` fired after about 90 seconds. The `[FIRING:1]` email arrived, prod was restored to 3 replicas, and a `[RESOLVED]` email followed. Alertmanager's `alertmanager_notifications_failed_total` stayed at 0.
+
+### Deployment reliability
+
+- Rolling updates use `maxUnavailable: 0` and `maxSurge: 1`, with `progressDeadlineSeconds: 300`, so capacity never drops during a release.
+- Each container has startup, readiness and liveness probes with 5 second timeouts.
+- The pipeline waits up to 300 seconds for each rollout and runs `kubectl rollout undo` automatically if it fails. Staging runs 1 replica per service and prod runs 3, to suit the small local cluster.
+- Quality gates: `ruff`, a non-blocking `pip-audit` (120 second cap), manifest validation with `kubectl kustomize`, and a Trivy image scan.
