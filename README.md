@@ -182,16 +182,42 @@ Shortcuts I took because this runs locally, and what I'd do instead:
 
 To repeat the rollback test, break the probe path in `k8s/base/api-deployment.yaml`, push, and revert once the build has failed. Wait for the failed build to finish before pushing the revert, because a new push aborts a running build.
 
-## Monitoring and logging ideas
+## Monitoring and logging
 
-I haven't set these up, but this is what I would add next:
+Prometheus and Grafana run **inside the cluster**, in their own `monitoring` namespace. The full
+`kube-prometheus-stack` Helm chart did not fit on this machine (Windows has 7 GB of RAM, WSL gets
+4.8 GB, Minikube started with 2.1 GB), so I run two plain Deployments instead. Together they are
+limited to about 580 MiB.
 
-- **Pipeline health.** The Jenkins Prometheus Metrics plugin with Grafana for build duration, success rate and queue time, and an alert after several failed builds in a row.
-- **Notifications.** A Slack or email message on failure, and another when a build is waiting for production approval.
-- **Cluster health.** kube-state-metrics with Prometheus, with alerts for unavailable replicas, crash-looping pods and failed rollouts.
-- **Application logs.** Send container logs to Loki or an EFK stack. For now, `kubectl logs deploy/<name> -n <namespace>` works.
-- **Audit trail.** The approval step records who approved a release in the build log, and Jenkins keeps the last 20 builds.
-- **Speed.** Replacing the Minikube image load with a registry push would remove about three minutes per build.
+| What | How |
+|------|-----|
+| Prometheus | Scrapes every `vaultai-api` pod in `vaultai-staging` and `vaultai-prod` (found through the Kubernetes API, so new replicas are picked up automatically) and Jenkins (`/prometheus/`, from the Prometheus Metrics plugin). 30s interval, 6h retention. |
+| Grafana | One provisioned dashboard, "VaultAI - App and CI/CD pipeline": scrape targets up/down, Jenkins up, builds recorded, average build duration, API requests per second by status, API p95 latency, API 5xx ratio. |
+| Alert rules | `VaultAIAPIDown`, `VaultAIHighErrorRate` (>5% 5xx), `VaultAIHighLatency` (p95 > 3s), `JenkinsDown`. |
+| Install | `bash monitoring/monitoring-lite.sh` (idempotent; `--remove` deletes everything). |
+| Access | Nothing is exposed outside the cluster. `monitoring/monitoring-portforward-service.sh` keeps `localhost:3000` (Grafana) and `localhost:9090` (Prometheus) available as systemd services. |
+
+**Security of the monitoring stack.** The namespace enforces the Pod Security `restricted` profile.
+Containers run as non-root with all capabilities dropped and a read-only root filesystem (Prometheus).
+Prometheus's service account can only read pod metadata. The Grafana admin password is random and
+stored in a Kubernetes Secret.
+
+**What I checked.** All 7 Prometheus targets were UP (Jenkins, Prometheus itself, 2 staging API pods
+and 3 prod API pods), and the Grafana dashboard loaded data from them.
+
+**Limits, stated plainly.**
+- There is no Alertmanager. The alert rules show as pending or firing on Prometheus's Alerts page, but
+  nothing is sent anywhere. I did not trigger an alert on purpose.
+- Metrics and dashboards live in temporary (emptyDir) volumes with 6 hours of retention, so history is lost when a pod restarts. The dashboard itself is provisioned from a ConfigMap and comes back.
+- No kube-state-metrics or node metrics, so there are no pod-restart or CPU/memory panels.
+- Logs are not collected centrally. `kubectl logs deploy/<name> -n <namespace>` is the current answer.
+
+**What I would add next.**
+- Alertmanager with a Slack receiver, and a build-failure alert from Jenkins metrics.
+- kube-state-metrics for unavailable replicas, crash loops and failed rollouts.
+- Loki (or EFK) for container logs.
+- A registry push instead of the Minikube image load, which would remove about 2 to 3 minutes per build.
+- The approval step already records who approved a release in the build log.
 
 ## Troubleshooting
 
@@ -200,3 +226,10 @@ I haven't set these up, but this is what I would add next:
 - **Rollout times out.** Look at `kubectl describe pod` and check the probe paths. The pipeline will already have rolled back.
 - **`ErrImagePull` in a pod.** The image wasn't loaded into Minikube. Check the "Load Images into Minikube" stage.
 - **A running build disappears after a new push.** That's the `abortPrevious` setting doing its job.
+- **Rollouts or health checks time out on a small machine.** This happened here: Minikube was capped at
+  2.1 GB and ran at 80 to 90 percent of it, probes timed out after 1 second, pods restarted and a rollout
+  hung for 30 minutes. Fixes: raise the container's memory cap (`monitoring/stabilize.sh` sets 3 GB without
+  recreating the cluster; the cap resets when Minikube or WSL restarts, so run it again after a restart),
+  and use probe timeouts of 5 seconds instead of the default 1 second. The deploy stage also wraps
+  `kubectl rollout status` in `timeout 240` so a stalled machine fails the build (and rolls back) in
+  minutes instead of hanging it.
