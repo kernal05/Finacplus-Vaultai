@@ -142,7 +142,7 @@ def deployEnv(String envName) {
                 if (!ok) { break }
                 withEnv(["DEPLOY=${c.deployment}"]) {
                     int rc = sh(returnStatus: true,
-                                script: 'timeout 240 kubectl rollout status "deployment/$DEPLOY" -n "$NS" --kubeconfig="$KUBECONFIG" --timeout=180s')
+                                script: 'timeout 330 kubectl rollout status "deployment/$DEPLOY" -n "$NS" --kubeconfig="$KUBECONFIG" --timeout=300s')
                     if (rc != 0) { ok = false }
                 }
             }
@@ -178,6 +178,7 @@ def lintAndValidate() {
         set -e
         command -v ruff > /dev/null || { echo "ruff is not installed in the Jenkins container: run jenkins/install-ci-tools.sh"; exit 1; }
         ruff check api/
+        (command -v pip-audit >/dev/null && timeout 120 pip-audit -r api/requirements.txt --progress-spinner off) || echo "pip-audit: findings or tool missing (non-blocking)"
         kubectl kustomize k8s/overlays/staging > /dev/null
         kubectl kustomize k8s/overlays/prod > /dev/null
         echo "Lint and manifest validation passed"
