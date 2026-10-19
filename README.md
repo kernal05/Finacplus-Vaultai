@@ -36,8 +36,8 @@ api/Dockerfile           API image (Python)
 app/Dockerfile           web image (Node build, served by nginx)
 nginx/default.conf       nginx config, including the API proxy
 k8s/base/                shared Deployments and Services
-k8s/rbac/               namespace-scoped RBAC for the Jenkins deployer (staging, prod)
-docs/screenshots/       evidence screenshots used in this README
+k8s/rbac/                namespace-scoped RBAC for the Jenkins deployer (staging, prod)
+docs/screenshots/        evidence screenshots used in this README
 k8s/overlays/staging/    namespace vaultai-staging, 1 replica
 k8s/overlays/prod/       namespace vaultai-prod, 3 replicas, higher API limits
 jenkins/Dockerfile       Jenkins image with the docker CLI and kubectl added
@@ -189,7 +189,7 @@ Two stages run on every branch, before anything is deployed:
 Dependencies in `api/requirements.txt` are pinned to exact versions, so two builds of the same commit install the same packages.
 
 **Known issues.**
-- Trivy reports HIGH and CRITICAL findings in the OS packages of the base images (Debian for the API, Alpine for the web image). The fix is a newer base image. The web image runs `apk upgrade` to pick up fixed packages; the API image now does the same with apt-get upgrade (build 32: 0 findings). The findings for each build are in its console log.
+- Trivy reports HIGH and CRITICAL findings in the OS packages of the base images (Debian for the API, Alpine for the web image). The fix is a newer base image. The web image runs `apk upgrade` to pick up fixed packages; the API image now does the same with apt-get upgrade, and both images scan clean. The findings for each build are in its console log.
 - The scan is report-only because enforcing it on day one would block deploys on findings I haven't triaged. Turning it on is a one-line change.
 - Trivy runs offline against a database copied into Jenkins (the download is slow on this connection), so it can be out of date.
 - There is no automated test suite for the application itself. The checks above, the manifest rendering and the smoke tests after each deploy are what guard a release.
@@ -217,10 +217,10 @@ Shortcuts I took because this runs locally, and what I'd do instead:
 - **Manifests:** `kubectl kustomize k8s/overlays/staging` and `.../prod` show the right namespace, replica count and limits.
 - **Webhook:** pushed a commit and watched `journalctl -u smee-jenkins -f`. It showed `POST ... - 200` and a build started right away.
 - **Smoke tests:** the API returns `{"status":"ok","service":"vaultai-api"}` and the web pod returns `ok`, in both environments.
-- **Full promotion (build 16):** staging, approval, then the same image tag in prod with 3 replicas each.
-- **Rollback (build 17):** I changed the API readiness probe path from `/healthz` to `/nope` and pushed. The new pod never became ready, the rollout hit the 180 second timeout, the pipeline ran the rollback and failed with "rolled back automatically", and production was never reached. Old pods kept serving the whole time.
-- **Recovery (build 18):** reverted the change, and the next build went through normally.
-- Push-triggered run (build 32): a push started the build by itself through the webhook. It passed pip-audit and Trivy (0 findings), staging, approval and production.
+- **Full promotion:** staging, approval, then the same image tag in prod with 3 replicas each.
+- **Rollback:** I changed the API readiness probe path from `/healthz` to `/nope` and pushed. The new pod never became ready, the rollout hit the timeout, the pipeline ran the rollback and failed with "rolled back automatically", and production was never reached. Old pods kept serving the whole time.
+- **Recovery:** reverted the change, and the next build went through normally.
+- Push-triggered run: a push started the build by itself through the webhook. It passed pip-audit and Trivy (0 findings), staging, approval and production.
 
 To repeat the rollback test, break the probe path in `k8s/base/api-deployment.yaml`, push, and revert once the build has failed. Wait for the failed build to finish before pushing the revert, because a new push aborts a running build.
 
@@ -244,11 +244,11 @@ Containers run as non-root with all capabilities dropped and a read-only root fi
 Prometheus's service account can only read pod metadata. The Grafana admin password is random and
 stored in a Kubernetes Secret.
 
-**What I checked.** All 7 Prometheus targets were UP (Jenkins, Prometheus itself, 2 staging API pods
+**What I checked.** All Prometheus targets were UP (Jenkins, Prometheus itself, 2 staging API pods
 and 3 prod API pods), and the Grafana dashboard loaded data from them.
 
 **Limits, stated plainly.**
-- Alert delivery is covered in the Alerting section below. Email notifications were verified with a live drill.
+- Alert delivery is covered in the Alerting section below. Email notifications were verified with a live drill (prod API scaled to zero, firing and resolved emails received).
   nothing is sent anywhere. I did not trigger an alert on purpose.
 - Metrics and dashboards live in temporary (emptyDir) volumes with 6 hours of retention, so history is lost when a pod restarts. The dashboard itself is provisioned from a ConfigMap and comes back.
 - No kube-state-metrics or node metrics, so there are no pod-restart or CPU/memory panels.
@@ -276,16 +276,16 @@ and 3 prod API pods), and the Grafana dashboard loaded data from them.
   `kubectl rollout status` in `timeout 330` so a stalled machine fails the build (and rolls back) in
   minutes instead of hanging it.
 
-## Image scan results (build 26)
+## Image scan results
 
-Trivy scans both images after they are built. It lists only findings that already have a fix available, and it is report-only, so findings do not fail the build. Results from build 26:
+Trivy scans both images after they are built. It lists only findings that already have a fix available, and it is report-only, so findings do not fail the build.
 
-| Image | Result |
-|---|---|
-| vaultai-web | 0 vulnerabilities. Before `apk upgrade` was added to its Dockerfile, the same image had 2 critical OpenSSL findings (libcrypto3 and libssl3). |
-| vaultai-api | 1 HIGH, 0 critical: libpcre2-8-0 (CVE-2026-103111), fixed in 10.46-1~deb13u3. All Python dependencies scanned clean. |
+| Image | Before | After |
+|---|---|---|
+| vaultai-web | 2 critical OpenSSL findings (`libcrypto3`, `libssl3`) | 0, after `apk upgrade` was added to its Dockerfile |
+| vaultai-api | 1 HIGH: `libpcre2-8-0` (CVE-2026-103111), fixed in 10.46-1~deb13u3 | 0, after `apt-get upgrade` was added to its Dockerfile |
 
-Both images now scan clean (API image verified in build 32), so SCAN_ENFORCE_CRITICAL can be switched to 'true'.
+All Python dependencies scan clean. Both images now scan clean, so `SCAN_ENFORCE_CRITICAL` can be switched to `'true'`.
 
 ## Alerting (Alertmanager, email)
 
@@ -376,7 +376,7 @@ The pipeline is written so that moving to a managed cluster changes the credenti
 
 | What it shows | Screenshot |
 |---|---|
-| Green pipeline (build #32): staging, manual approval, production | ![build](docs/screenshots/01-jenkins-build-32-green.png) |
+| Green pipeline: staging, manual approval, production | ![build](docs/screenshots/01-jenkins-build-32-green.png) |
 | Push-triggered build via the smee.io webhook | ![webhook](docs/screenshots/02-github-webhook-delivery.png) |
 | Trivy image scan with 0 fixable HIGH or CRITICAL findings | ![scan](docs/screenshots/03-image-scan-zero-findings.png) |
 | Pods running in staging, prod and monitoring | ![pods](docs/screenshots/04-pods-staging-prod-monitoring.png) |
