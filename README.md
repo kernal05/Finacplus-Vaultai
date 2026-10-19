@@ -22,6 +22,7 @@ flowchart LR
   D --> S[(vaultai-staging)]
   F --> P[(vaultai-prod)]
   M[Prometheus + Grafana] -.->|scrape| S
+  M -.->|alerts| AM[Alertmanager] -.->|email| U[You]
   M -.->|scrape| P
   M -.->|scrape| J
 ```
@@ -231,7 +232,7 @@ Shortcuts I took because this runs locally, and what I'd do instead:
 - **Full promotion:** staging, approval, then the same image tag in prod with 3 replicas each.
 - **Rollback:** I changed the API readiness probe path from `/healthz` to `/nope` and pushed. The new pod never became ready, the rollout hit the timeout, the pipeline ran the rollback and failed with "rolled back automatically", and production was never reached. Old pods kept serving the whole time.
 - **Recovery:** reverted the change, and the next build went through normally.
-- Push-triggered run: a push started the build by itself through the webhook. It passed pip-audit and Trivy (0 findings), staging, approval and production.
+- **Push-triggered run:** a push started the build by itself through the webhook. It passed pip-audit and Trivy (0 findings), staging, approval and production.
 
 To repeat the rollback test, break the probe path in `k8s/base/api-deployment.yaml`, push, and revert once the build has failed. Wait for the failed build to finish before pushing the revert, because a new push aborts a running build.
 
