@@ -4,6 +4,65 @@ This repo has a Jenkins pipeline that builds and deploys the VaultAI app wheneve
 
 I built and tested all of this on a local Minikube cluster, so a few things (the webhook tunnel, loading images straight into Minikube) are local-dev workarounds. I've listed them in the security section so it's clear what I would change in a real setup.
 
+## At a glance
+
+| | |
+|---|---|
+| **What it is** | A push-to-deploy CI/CD pipeline: GitHub, Jenkins (Groovy), Kubernetes, with monitoring and alerting |
+| **What happens on a push** | Lint, build, scan, deploy to staging, smoke test, one approval, the same image goes to production |
+| **If something breaks** | The rollout is undone automatically and prod is never touched. An alert email arrives if the app goes down |
+| **Result** | A full run takes about 14 to 17 minutes here, down from 25 to 30. Moving to a registry should bring it to roughly 10 to 14 (estimate) |
+| **Effort** | About 5 to 7 hours to get the infrastructure running. The rest of the time went into debugging, hardening and documentation |
+| **Runs on** | One laptop (Minikube), no cloud spend. The cloud path is documented as a plan |
+
+## The assignment, and where each part is answered
+
+This is my submission for the CI/CD case study: Git + Jenkins + Kubernetes, automated with Groovy.
+
+| Requirement | How it is met | Where to look |
+|---|---|---|
+| A commit to a Git repo triggers a Jenkins build | GitHub push webhook (relayed by smee.io because Jenkins runs on localhost) starts a Multibranch Pipeline | [Triggering builds on push](#5-triggering-builds-on-push) |
+| A successful build is deployed to a Kubernetes cluster | Images are built, scanned, deployed to staging, smoke-tested, then promoted to prod after one approval | [What the pipeline does](#what-the-pipeline-does) |
+| Scalable and adaptable to other repos and clusters | Two config functions in the Jenkinsfile (`appConfig()`, `envConfig()`) plus a Kustomize overlay per environment. No pipeline code changes | [Using it for other repos or clusters](#using-it-for-other-repos-or-clusters) |
+| Groovy automation logic | `Jenkinsfile`: Declarative pipeline with Groovy helper functions (`deployEnv`, `smokeTest`, `rollbackEnv`, `syncSecret`, `scanImages` and others) | `Jenkinsfile` |
+| Less manual work, consistent releases | One image per commit (`build-<n>-<sha>`) is built once and promoted. The same manifests are used for every environment | [How it fits together](#how-it-fits-together) |
+| Well-documented, easy to maintain | This README, comments in the Jenkinsfile, config kept in two functions | this file |
+| Robust, clear feedback on failure | Timeouts on every stage, automatic `kubectl rollout undo` on a failed rollout or smoke test, per-stage logs, email alerts when the app goes down | [Deployment reliability](#deployment-reliability), [Troubleshooting](#troubleshooting) |
+| Security best practices | No secrets in git, Jenkins credentials, per-environment namespace-scoped RBAC, approval gate limited to named users, lint + dependency pins + image scan, non-root containers, restricted monitoring namespace | [Security notes](#security-notes) |
+| Optional: tests and validation | Lint, manifest rendering, Trivy scan, smoke tests, a rollback test and an alert drill, all recorded | [Quality checks](#quality-checks-and-image-scanning), [How I tested it](#how-i-tested-it) |
+| Optional: monitoring and logging | Prometheus, Grafana dashboard, Alertmanager email alerts, tested with a live outage drill | [Monitoring and logging](#monitoring-and-logging), [Alerting](#alerting-alertmanager-email) |
+
+## Quick start
+
+For someone who wants to see it running. The full explanation of each step is in [Setup](#setup).
+
+1. Start Minikube, then create the namespaces: `kubectl create namespace vaultai-staging` and `kubectl create namespace vaultai-prod`.
+2. Build and start Jenkins from `jenkins/Dockerfile` (command in [Setup, step 2](#2-jenkins)) and run `bash jenkins/install-ci-tools.sh`.
+3. Add the four credentials listed in [step 3](#3-credentials).
+4. Create a Multibranch Pipeline job pointing at this repo.
+5. Push a commit to `main`. Staging deploys by itself. Choose "Deploy to production" at the approval step to promote the same image.
+6. Optional: `bash monitoring/monitoring-lite.sh` installs Prometheus, Grafana and Alertmanager.
+
+## Impact
+
+These are my own observations from this project, not a formal benchmark.
+
+| Area | Before | After | What changed |
+|---|---|---|---|
+| Run time, push to staging and prod | About 25 to 30 minutes per run | Roughly 14 to 17 minutes once Docker layers are cached | Minikube was starved of memory (a 2.1 GB cap), so builds, image loads and probes crawled and one run hung for over 30 minutes. I raised the cap to 3 GB and used 5 second probe timeouts. The slow Python dependency layer is now cached with a BuildKit cache mount, so only changed layers rebuild |
+| Manual effort | Build, load and `kubectl` commands typed by hand | Staging deploys from a push with no intervention. Production needs one click | Webhook trigger, Multibranch Pipeline, one approval gate |
+| A bad release | Stays broken until someone notices | A failed rollout or smoke test rolls back on its own, and prod is never reached | `rollbackEnv()` on both the rollout check and the smoke test. I tested it by breaking a probe path on purpose |
+| Credential reach | One shared cluster-admin kubeconfig | Staging and prod each have their own namespace-scoped ServiceAccount token | RBAC in `k8s/rbac/`, two separate Jenkins credentials, checked with `kubectl auth can-i` |
+| Noticing an outage | Nobody knows until someone looks | An email arrives about 90 seconds after the prod API disappears, and another when it recovers | Prometheus rule + Alertmanager, verified with a live drill |
+| Adding a service or environment | Copy and edit pipeline logic | Add an entry to `appConfig()` or `envConfig()` and a Kustomize overlay | Config-driven Jenkinsfile |
+| Cost | A managed CI server, cluster and monitoring plan would be a recurring bill | No cloud spend. It all runs on one laptop | Minikube, Jenkins in a container, self-hosted Prometheus, Grafana and Alertmanager |
+
+**Where the remaining time goes, and the next speedup.** Loading the images into Minikube takes about three minutes, and a full image build is the other big cost. A private registry removes the load step, and pushes only the layers that changed, so I expect a run of roughly 10 to 14 minutes. That figure is an estimate, not something I measured, because I did not have a registry in this setup.
+
+**Effort.** Getting the infrastructure running (Jenkins, Minikube, the pipeline, the webhook) took about 5 to 7 hours. The rest of the project went into debugging, hardening (RBAC, scanning, rollback, approval rules), monitoring and documentation. Section "Problems I hit and how I fixed them" lists the real issues.
+
+The same pipeline logic is meant to run on EKS or GKE with a registry added. Only the credentials and the image-push step change (see [Deploying to AWS or GCP](#deploying-to-aws-or-gcp-instead-of-minikube)). I have not run it on a cloud cluster.
+
 ## How it fits together
 
 ![Architecture diagram](docs/architecture.png)
@@ -161,7 +220,7 @@ On a real server with a public address, GitHub would call Jenkins directly and n
 4. **Image scan.** Trivy lists the HIGH and CRITICAL vulnerabilities that have a fix available, for each image. It is report-only at the moment; setting `SCAN_ENFORCE_CRITICAL = 'true'` in the Jenkinsfile makes fixable CRITICAL findings fail the build.
 5. **Load images into Minikube.** Copies the images into the cluster node. This stands in for pushing to a registry and takes about three minutes, which is the slowest part of the pipeline.
 6. **Sync staging secret.** Creates or updates the Kubernetes Secret before the deploy, so new pods start with the current value.
-7. **Deploy staging.** Applies the staging overlay with this build's image tags pinned into it, and waits for the rollout. If the rollout doesn't finish in 300 seconds, it runs `kubectl rollout undo` on every component and fails the build.
+7. **Deploy staging.** Applies the staging overlay with this build's image tags pinned into it, and waits for the rollout. If the rollout doesn't finish in 300 seconds (the whole step is capped at 330), it runs `kubectl rollout undo` on every component and fails the build.
 8. **Staging smoke test.** Runs the health endpoints from inside the API and web pods.
 9. **Approve production.** Waits up to 30 minutes for a person to choose. The default option is "Skip production (staging only)". This step doesn't hold a Jenkins executor while it waits.
 10. **Production stages.** Same secret, deploy and smoke test steps against the prod overlay, using the image that was already tested in staging.
@@ -236,6 +295,13 @@ Shortcuts I took because this runs locally, and what I'd do instead:
 
 To repeat the rollback test, break the probe path in `k8s/base/api-deployment.yaml`, push, and revert once the build has failed. Wait for the failed build to finish before pushing the revert, because a new push aborts a running build.
 
+## Deployment reliability
+
+- Rolling updates use `maxUnavailable: 0` and `maxSurge: 1`, with `progressDeadlineSeconds: 300`, so capacity never drops during a release.
+- Each container has startup, readiness and liveness probes with 5 second timeouts.
+- The pipeline waits up to 300 seconds for each rollout and runs `kubectl rollout undo` automatically if it fails. Staging runs 1 replica per service and prod runs 3, to suit the small local cluster.
+- Quality gates: `ruff`, a non-blocking `pip-audit` (120 second cap), manifest validation with `kubectl kustomize`, and a Trivy image scan.
+
 ## Monitoring and logging
 
 Prometheus and Grafana run **inside the cluster**, in their own `monitoring` namespace. The full
@@ -256,8 +322,7 @@ Containers run as non-root with all capabilities dropped and a read-only root fi
 Prometheus's service account can only read pod metadata. The Grafana admin password is random and
 stored in a Kubernetes Secret.
 
-**What I checked.** All Prometheus targets were UP (Jenkins, Prometheus itself, 2 staging API pods
-and 3 prod API pods), and the Grafana dashboard loaded data from them.
+**What I checked.** All Prometheus targets were UP (Jenkins, Prometheus itself, and the staging and prod API pods), and the Grafana dashboard loaded data from them.
 
 **Limits, stated plainly.**
 - Alerts go out by email only. There is no Slack or paging receiver. Delivery was verified with a live drill (prod API scaled to zero, firing and resolved emails received).
@@ -281,12 +346,35 @@ Prometheus evaluates the alert rules and sends firing alerts to Alertmanager, wh
 - Alert rules: `VaultAIAPIDown`, `VaultAIHighErrorRate`, `VaultAIHighLatency`, `JenkinsDown`, and `VaultAIAPIMissing`. The last one fires when no API pods exist in `vaultai-prod`, which catches the case where the API is scaled to zero.
 - Verification: the prod API was scaled to 0 and `VaultAIAPIMissing` fired after about 90 seconds. The `[FIRING:1]` email arrived, prod was restored to 3 replicas, and a `[RESOLVED]` email followed. Alertmanager's `alertmanager_notifications_failed_total` stayed at 0.
 
-### Deployment reliability
 
-- Rolling updates use `maxUnavailable: 0` and `maxSurge: 1`, with `progressDeadlineSeconds: 300`, so capacity never drops during a release.
-- Each container has startup, readiness and liveness probes with 5 second timeouts.
-- The pipeline waits up to 300 seconds for each rollout and runs `kubectl rollout undo` automatically if it fails. Staging runs 1 replica per service and prod runs 3, to suit the small local cluster.
-- Quality gates: `ruff`, a non-blocking `pip-audit` (120 second cap), manifest validation with `kubectl kustomize`, and a Trivy image scan.
+## Problems I hit and how I fixed them
+
+The pipeline was not right the first time. These are the real issues, in the order they mattered.
+
+| Problem | How I found it | Fix |
+|---|---|---|
+| A build hung for over 30 minutes, another failed | Pods restarted, `kubectl get events` showed probe timeouts, and `docker stats` showed Minikube at 80 to 90 percent of its 2.1 GB cap | Raised the container's memory cap to 3 GB (`monitoring/stabilize.sh`) and set probe `timeoutSeconds: 5` instead of 1. The deploy step now has a hard timeout, so a stall fails and rolls back instead of hanging |
+| Rebuilding the API image took about 14 minutes | The Python dependency layer was reinstalled on every build over a slow connection | A BuildKit cache mount on the pip layer, and pinned dependencies so the layer only changes when they do |
+| Webhook returned `401 An access token is required` | smee.io relay log and the Jenkins response | `NOTIFY_COMMIT_ACCESS_CONTROL=disabled-for-polling`, which only lets the endpoint trigger a rescan. A real server would use a token or a signed webhook |
+| `ErrImagePull` in the cluster | `kubectl describe pod` | Minikube has its own Docker daemon, so images must be loaded into it. Added the load stage to the pipeline |
+| The full `kube-prometheus-stack` did not fit | The chart's pods needed more memory than the node had | Replaced it with two small Deployments (Prometheus and Grafana) with explicit limits, then added Alertmanager |
+| `kubectl port-forward` blocked terminals and died | Foreground processes | Ran them as systemd services that restart themselves |
+| The "API down" alert would not fire when the API was scaled to zero | The `up` metric disappears when there are no pods, so the expression never matches | Added `VaultAIAPIMissing`, which fires when no prod API pods exist, and proved it with a live drill |
+| Image scan needed a 130 MB database and the download was slow | Trivy retried and timed out | Download once on the host, copy the database into Jenkins and scan offline |
+
+## Known limitations
+
+Stated up front so nobody has to find them:
+
+- **Local only.** Everything ran on one Minikube node. Images are loaded into the node instead of pushed to a registry, so they are not scanned or signed in a registry and cannot be pulled by another cluster.
+- **Cloud steps are a plan, not a result.** I did not have a GCP or AWS account to run it on, so [Deploying to AWS or GCP](#deploying-to-aws-or-gcp-instead-of-minikube) is untested. Terraform is not used. Namespaces and RBAC are plain manifests.
+- **The Anthropic API key is shared.** Staging and prod have separate cluster credentials, but both read the same `vaultai-anthropic-key` Jenkins credential. Splitting it is a one-line change in `envConfig()` plus a second credential.
+- **Docker socket and admin kubeconfig.** Jenkins mounts the Docker socket, which is effectively root on the host. The `docker run` command also mounts the admin kubeconfig for one-time setup. The pipeline itself uses only the scoped credentials, but I would remove that mount after setup.
+- **No automated test suite for the application.** Quality is guarded by lint, manifest rendering, the image scan and smoke tests after each deploy.
+- **Image scan is report-only** (`SCAN_ENFORCE_CRITICAL = 'false'`). Both images scan clean now, so it can be switched on.
+- **Metrics history is temporary.** Prometheus and Grafana use emptyDir volumes with 6 hours of retention. Logs are not collected centrally.
+- **Alerts are email only.** No Slack or paging receiver.
+- **A new push aborts a build waiting for approval** (`abortPrevious`). That is deliberate, but it also stops a deploy that is running when the push arrives.
 
 ## Troubleshooting
 
@@ -385,4 +473,4 @@ The pipeline is written so that moving to a managed cluster changes the credenti
 | Alert resolved email | ![resolved](docs/screenshots/07-alert-resolved-email.png) |
 | Prometheus targets | ![prometheus](docs/screenshots/08-prometheus-targets.png) |
 
-Note: on the 4.8 GB local machine a full run takes about 30 minutes, mostly building images and loading them into Minikube. A managed cluster with a registry removes the slow load step.
+Note: on this 4.8 GB laptop a full run takes roughly 14 to 17 minutes once Docker layers are cached. A first build, or a run after Minikube hit its memory limit, can take much longer. The slowest remaining step is loading images into Minikube (about three minutes). A registry removes it, and should bring a run to roughly 10 to 14 minutes (estimate, not measured).
