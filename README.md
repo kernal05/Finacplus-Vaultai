@@ -248,7 +248,7 @@ stored in a Kubernetes Secret.
 and 3 prod API pods), and the Grafana dashboard loaded data from them.
 
 **Limits, stated plainly.**
-- Alert delivery is covered in the Alerting section below. Email notifications were verified with a live drill (prod API scaled to zero, firing and resolved emails received).
+- Alert emails were verified with a live drill (prod API scaled to zero, firing and resolved emails received). Only email is configured, with no Slack or paging receiver.
   nothing is sent anywhere. I did not trigger an alert on purpose.
 - Metrics and dashboards live in temporary (emptyDir) volumes with 6 hours of retention, so history is lost when a pod restarts. The dashboard itself is provisioned from a ConfigMap and comes back.
 - No kube-state-metrics or node metrics, so there are no pod-restart or CPU/memory panels.
