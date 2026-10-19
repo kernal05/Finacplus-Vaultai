@@ -373,6 +373,24 @@ The pipeline was not right the first time. These are the real issues, in the ord
 | The "API down" alert would not fire when the API was scaled to zero | The `up` metric disappears when there are no pods, so the expression never matches | Added `VaultAIAPIMissing`, which fires when no prod API pods exist, and proved it with a live drill |
 | Image scan needed a 130 MB database and the download was slow | Trivy retried and timed out | Download once on the host, copy the database into Jenkins and scan offline |
 
+## How I worked: AI-assisted, human-verified
+
+I used an AI assistant (Claude) throughout this project, the way I would use a senior colleague or the documentation: to move faster on work that follows well-known patterns, not to replace understanding. The AI knows the common patterns. I know this system: what it runs on, what broke, and why each choice was made.
+
+**Where AI helped**
+- First drafts of boilerplate: the Jenkinsfile helper functions, Kustomize overlays, RBAC manifests, shell scripts, the README structure and the diagram.
+- Recalling syntax and flags quickly (kubectl, Trivy, Prometheus relabeling, Alertmanager configuration).
+- A second pair of eyes: reviewing my work for gaps, such as missing quality gates, and for README numbers that did not match the manifests.
+
+**What I did myself**
+- **Design decisions.** One image built once and promoted, Kustomize overlays instead of a branch per environment, separate scoped credentials for staging and prod, an approval gate, and a report-only scan to start with.
+- **Ran and read everything.** Every command ran on my own machine, and I read the output. When something failed I worked from evidence (`docker stats`, `kubectl get events`, Jenkins console logs). That is how the memory starvation, the probe timeouts and the webhook 401 were found and fixed.
+- **Trade-offs.** I dropped the full `kube-prometheus-stack` because it did not fit my machine, kept the image scan report-only until the findings were clean, and chose a documented plan over an untested cloud setup.
+- **Verified instead of trusting.** I broke a probe path on purpose to prove the rollback, scaled prod to zero to prove the alert email, and checked the documentation against the repository.
+- **Corrected the AI where it was wrong for my setup.** For example a command flag that did not exist, a tool that was missing on my machine, and README claims that disagreed with the real replica counts and timeouts.
+
+I can explain any part of this repository and why it is built that way. The AI made me faster. It did not make the decisions.
+
 ## Known limitations
 
 Stated up front so nobody has to find them:
