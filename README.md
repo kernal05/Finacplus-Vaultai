@@ -194,6 +194,17 @@ Dependencies in `api/requirements.txt` are pinned to exact versions, so two buil
 - Trivy runs offline against a database copied into Jenkins (the download is slow on this connection), so it can be out of date.
 - There is no automated test suite for the application itself. The checks above, the manifest rendering and the smoke tests after each deploy are what guard a release.
 
+## Image scan results
+
+Trivy scans both images after they are built. It lists only findings that already have a fix available, and it is report-only, so findings do not fail the build.
+
+| Image | Before | After |
+|---|---|---|
+| vaultai-web | 2 critical OpenSSL findings (`libcrypto3`, `libssl3`) | 0, after `apk upgrade` was added to its Dockerfile |
+| vaultai-api | 1 HIGH: `libpcre2-8-0` (CVE-2026-103111), fixed in 10.46-1~deb13u3 | 0, after `apt-get upgrade` was added to its Dockerfile |
+
+All Python dependencies scan clean. Both images now scan clean, so `SCAN_ENFORCE_CRITICAL` can be switched to `'true'`.
+
 ## Security notes
 
 What is already in place:
@@ -248,8 +259,7 @@ stored in a Kubernetes Secret.
 and 3 prod API pods), and the Grafana dashboard loaded data from them.
 
 **Limits, stated plainly.**
-- Alert emails were verified with a live drill (prod API scaled to zero, firing and resolved emails received). Only email is configured, with no Slack or paging receiver.
-  nothing is sent anywhere. I did not trigger an alert on purpose.
+- Alerts go out by email only. There is no Slack or paging receiver. Delivery was verified with a live drill (prod API scaled to zero, firing and resolved emails received).
 - Metrics and dashboards live in temporary (emptyDir) volumes with 6 hours of retention, so history is lost when a pod restarts. The dashboard itself is provisioned from a ConfigMap and comes back.
 - No kube-state-metrics or node metrics, so there are no pod-restart or CPU/memory panels.
 - Logs are not collected centrally. `kubectl logs deploy/<name> -n <namespace>` is the current answer.
@@ -260,32 +270,6 @@ and 3 prod API pods), and the Grafana dashboard loaded data from them.
 - Loki (or EFK) for container logs.
 - A registry push instead of the Minikube image load, which would remove about 2 to 3 minutes per build.
 - The approval step already records who approved a release in the build log.
-
-## Troubleshooting
-
-- **Webhook returns 401.** The Git plugin wants a notifyCommit token. Either create one or use the `JAVA_OPTS` flag from step 2.
-- **"No git jobs using repository" in the webhook response.** Normal for a multibranch job. It still schedules a branch scan.
-- **Rollout times out.** Look at `kubectl describe pod` and check the probe paths. The pipeline will already have rolled back.
-- **`ErrImagePull` in a pod.** The image wasn't loaded into Minikube. Check the "Load Images into Minikube" stage.
-- **A running build disappears after a new push.** That's the `abortPrevious` setting doing its job.
-- **Rollouts or health checks time out on a small machine.** This happened here: Minikube was capped at
-  2.1 GB and ran at 80 to 90 percent of it, probes timed out after 1 second, pods restarted and a rollout
-  hung for 30 minutes. Fixes: raise the container's memory cap (`monitoring/stabilize.sh` sets 3 GB without
-  recreating the cluster; the cap resets when Minikube or WSL restarts, so run it again after a restart),
-  and use probe timeouts of 5 seconds instead of the default 1 second. The deploy stage also wraps
-  `kubectl rollout status` in `timeout 330` so a stalled machine fails the build (and rolls back) in
-  minutes instead of hanging it.
-
-## Image scan results
-
-Trivy scans both images after they are built. It lists only findings that already have a fix available, and it is report-only, so findings do not fail the build.
-
-| Image | Before | After |
-|---|---|---|
-| vaultai-web | 2 critical OpenSSL findings (`libcrypto3`, `libssl3`) | 0, after `apk upgrade` was added to its Dockerfile |
-| vaultai-api | 1 HIGH: `libpcre2-8-0` (CVE-2026-103111), fixed in 10.46-1~deb13u3 | 0, after `apt-get upgrade` was added to its Dockerfile |
-
-All Python dependencies scan clean. Both images now scan clean, so `SCAN_ENFORCE_CRITICAL` can be switched to `'true'`.
 
 ## Alerting (Alertmanager, email)
 
@@ -302,6 +286,21 @@ Prometheus evaluates the alert rules and sends firing alerts to Alertmanager, wh
 - Each container has startup, readiness and liveness probes with 5 second timeouts.
 - The pipeline waits up to 300 seconds for each rollout and runs `kubectl rollout undo` automatically if it fails. Staging runs 1 replica per service and prod runs 3, to suit the small local cluster.
 - Quality gates: `ruff`, a non-blocking `pip-audit` (120 second cap), manifest validation with `kubectl kustomize`, and a Trivy image scan.
+
+## Troubleshooting
+
+- **Webhook returns 401.** The Git plugin wants a notifyCommit token. Either create one or use the `JAVA_OPTS` flag from step 2.
+- **"No git jobs using repository" in the webhook response.** Normal for a multibranch job. It still schedules a branch scan.
+- **Rollout times out.** Look at `kubectl describe pod` and check the probe paths. The pipeline will already have rolled back.
+- **`ErrImagePull` in a pod.** The image wasn't loaded into Minikube. Check the "Load Images into Minikube" stage.
+- **A running build disappears after a new push.** That's the `abortPrevious` setting doing its job.
+- **Rollouts or health checks time out on a small machine.** This happened here: Minikube was capped at
+  2.1 GB and ran at 80 to 90 percent of it, probes timed out after 1 second, pods restarted and a rollout
+  hung for 30 minutes. Fixes: raise the container's memory cap (`monitoring/stabilize.sh` sets 3 GB without
+  recreating the cluster; the cap resets when Minikube or WSL restarts, so run it again after a restart),
+  and use probe timeouts of 5 seconds instead of the default 1 second. The deploy stage also wraps
+  `kubectl rollout status` in `timeout 330` so a stalled machine fails the build (and rolls back) in
+  minutes instead of hanging it.
 
 ## Deploying to AWS or GCP instead of Minikube
 
@@ -376,7 +375,7 @@ The pipeline is written so that moving to a managed cluster changes the credenti
 
 | What it shows | Screenshot |
 |---|---|
-| Green pipeline: staging, manual approval, production | ![build](docs/screenshots/01-jenkins-build-32-green.png) |
+| Green pipeline: staging, manual approval, production | ![build](docs/screenshots/01-jenkins-pipeline-green.png) |
 | Push-triggered build via the smee.io webhook | ![webhook](docs/screenshots/02-github-webhook-delivery.png) |
 | Trivy image scan with 0 fixable HIGH or CRITICAL findings | ![scan](docs/screenshots/03-image-scan-zero-findings.png) |
 | Pods running in staging, prod and monitoring | ![pods](docs/screenshots/04-pods-staging-prod-monitoring.png) |
