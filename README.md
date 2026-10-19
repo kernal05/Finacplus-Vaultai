@@ -36,7 +36,9 @@ api/Dockerfile           API image (Python)
 app/Dockerfile           web image (Node build, served by nginx)
 nginx/default.conf       nginx config, including the API proxy
 k8s/base/                shared Deployments and Services
-k8s/overlays/staging/    namespace vaultai-staging, 2 replicas
+k8s/rbac/               namespace-scoped RBAC for the Jenkins deployer (staging, prod)
+docs/screenshots/       evidence screenshots used in this README
+k8s/overlays/staging/    namespace vaultai-staging, 1 replica
 k8s/overlays/prod/       namespace vaultai-prod, 3 replicas, higher API limits
 jenkins/Dockerfile       Jenkins image with the docker CLI and kubectl added
 jenkins/install-ci-tools.sh  puts ruff and the Trivy database into the running Jenkins container
@@ -158,7 +160,7 @@ On a real server with a public address, GitHub would call Jenkins directly and n
 4. **Image scan.** Trivy lists the HIGH and CRITICAL vulnerabilities that have a fix available, for each image. It is report-only at the moment; setting `SCAN_ENFORCE_CRITICAL = 'true'` in the Jenkinsfile makes fixable CRITICAL findings fail the build.
 5. **Load images into Minikube.** Copies the images into the cluster node. This stands in for pushing to a registry and takes about three minutes, which is the slowest part of the pipeline.
 6. **Sync staging secret.** Creates or updates the Kubernetes Secret before the deploy, so new pods start with the current value.
-7. **Deploy staging.** Applies the staging overlay with this build's image tags pinned into it, and waits for the rollout. If the rollout doesn't finish in 180 seconds, it runs `kubectl rollout undo` on every component and fails the build.
+7. **Deploy staging.** Applies the staging overlay with this build's image tags pinned into it, and waits for the rollout. If the rollout doesn't finish in 300 seconds, it runs `kubectl rollout undo` on every component and fails the build.
 8. **Staging smoke test.** Runs the health endpoints from inside the API and web pods.
 9. **Approve production.** Waits up to 30 minutes for a person to choose. The default option is "Skip production (staging only)". This step doesn't hold a Jenkins executor while it waits.
 10. **Production stages.** Same secret, deploy and smoke test steps against the prod overlay, using the image that was already tested in staging.
@@ -187,7 +189,7 @@ Two stages run on every branch, before anything is deployed:
 Dependencies in `api/requirements.txt` are pinned to exact versions, so two builds of the same commit install the same packages.
 
 **Known issues.**
-- Trivy reports HIGH and CRITICAL findings in the OS packages of the base images (Debian for the API, Alpine for the web image). The fix is a newer base image. The web image runs `apk upgrade` to pick up fixed packages; the API image does not do this yet. The findings for each build are in its console log.
+- Trivy reports HIGH and CRITICAL findings in the OS packages of the base images (Debian for the API, Alpine for the web image). The fix is a newer base image. The web image runs `apk upgrade` to pick up fixed packages; the API image now does the same with apt-get upgrade (build 32: 0 findings). The findings for each build are in its console log.
 - The scan is report-only because enforcing it on day one would block deploys on findings I haven't triaged. Turning it on is a one-line change.
 - Trivy runs offline against a database copied into Jenkins (the download is slow on this connection), so it can be out of date.
 - There is no automated test suite for the application itself. The checks above, the manifest rendering and the smoke tests after each deploy are what guard a release.
@@ -198,7 +200,7 @@ What is already in place:
 
 - No credentials in the code or the git history. `git grep "sk-ant"` and `git log -S"sk-ant"` both return nothing.
 - Secrets reach the pipeline through Jenkins credentials and are masked in logs.
-- Production needs a manual approval, and only the Jenkins users or groups listed in `PROD_APPROVERS` in the Jenkinsfile can give it. Both environments still share the same Jenkins credentials, which is listed in the shortcuts table below.
+- Production needs a manual approval, and only the Jenkins users or groups listed in `PROD_APPROVERS` in the Jenkinsfile can give it. Each environment uses its own namespace-scoped kubeconfig credential.
 - Only `main` deploys. Other branches stop after building images.
 - The API container runs as a non-root user. All containers have resource limits and liveness and readiness probes.
 
@@ -218,6 +220,7 @@ Shortcuts I took because this runs locally, and what I'd do instead:
 - **Full promotion (build 16):** staging, approval, then the same image tag in prod with 3 replicas each.
 - **Rollback (build 17):** I changed the API readiness probe path from `/healthz` to `/nope` and pushed. The new pod never became ready, the rollout hit the 180 second timeout, the pipeline ran the rollback and failed with "rolled back automatically", and production was never reached. Old pods kept serving the whole time.
 - **Recovery (build 18):** reverted the change, and the next build went through normally.
+- Push-triggered run (build 32): a push started the build by itself through the webhook. It passed pip-audit and Trivy (0 findings), staging, approval and production.
 
 To repeat the rollback test, break the probe path in `k8s/base/api-deployment.yaml`, push, and revert once the build has failed. Wait for the failed build to finish before pushing the revert, because a new push aborts a running build.
 
@@ -232,7 +235,7 @@ limited to about 580 MiB.
 |------|-----|
 | Prometheus | Scrapes every `vaultai-api` pod in `vaultai-staging` and `vaultai-prod` (found through the Kubernetes API, so new replicas are picked up automatically) and Jenkins (`/prometheus/`, from the Prometheus Metrics plugin). 30s interval, 6h retention. |
 | Grafana | One provisioned dashboard, "VaultAI - App and CI/CD pipeline": scrape targets up/down, Jenkins up, builds recorded, average build duration, API requests per second by status, API p95 latency, API 5xx ratio. |
-| Alert rules | `VaultAIAPIDown`, `VaultAIHighErrorRate` (>5% 5xx), `VaultAIHighLatency` (p95 > 3s), `JenkinsDown`. |
+| Alert rules | `VaultAIAPIDown`, `VaultAIHighErrorRate` (>5% 5xx), `VaultAIHighLatency` (p95 > 3s), `JenkinsDown` and `VaultAIAPIMissing` (no prod API pods). Alerts are emailed through Alertmanager. |
 | Install | `bash monitoring/monitoring-lite.sh` (idempotent; `--remove` deletes everything). |
 | Access | Nothing is exposed outside the cluster. `monitoring/monitoring-portforward-service.sh` keeps `localhost:3000` (Grafana) and `localhost:9090` (Prometheus) available as systemd services. |
 
@@ -245,14 +248,14 @@ stored in a Kubernetes Secret.
 and 3 prod API pods), and the Grafana dashboard loaded data from them.
 
 **Limits, stated plainly.**
-- There is no Alertmanager. The alert rules show as pending or firing on Prometheus's Alerts page, but
+- Alert delivery is covered in the Alerting section below. Email notifications were verified with a live drill.
   nothing is sent anywhere. I did not trigger an alert on purpose.
 - Metrics and dashboards live in temporary (emptyDir) volumes with 6 hours of retention, so history is lost when a pod restarts. The dashboard itself is provisioned from a ConfigMap and comes back.
 - No kube-state-metrics or node metrics, so there are no pod-restart or CPU/memory panels.
 - Logs are not collected centrally. `kubectl logs deploy/<name> -n <namespace>` is the current answer.
 
 **What I would add next.**
-- Alertmanager with a Slack receiver, and a build-failure alert from Jenkins metrics.
+- A Slack receiver next to the email one, and a build-failure alert from Jenkins metrics.
 - kube-state-metrics for unavailable replicas, crash loops and failed rollouts.
 - Loki (or EFK) for container logs.
 - A registry push instead of the Minikube image load, which would remove about 2 to 3 minutes per build.
@@ -270,7 +273,7 @@ and 3 prod API pods), and the Grafana dashboard loaded data from them.
   hung for 30 minutes. Fixes: raise the container's memory cap (`monitoring/stabilize.sh` sets 3 GB without
   recreating the cluster; the cap resets when Minikube or WSL restarts, so run it again after a restart),
   and use probe timeouts of 5 seconds instead of the default 1 second. The deploy stage also wraps
-  `kubectl rollout status` in `timeout 240` so a stalled machine fails the build (and rolls back) in
+  `kubectl rollout status` in `timeout 330` so a stalled machine fails the build (and rolls back) in
   minutes instead of hanging it.
 
 ## Image scan results (build 26)
@@ -282,7 +285,7 @@ Trivy scans both images after they are built. It lists only findings that alread
 | vaultai-web | 0 vulnerabilities. Before `apk upgrade` was added to its Dockerfile, the same image had 2 critical OpenSSL findings (libcrypto3 and libssl3). |
 | vaultai-api | 1 HIGH, 0 critical: libpcre2-8-0 (CVE-2026-103111), fixed in 10.46-1~deb13u3. All Python dependencies scanned clean. |
 
-Next step for the API image: run `apt-get upgrade` in its Dockerfile, as the web image does with `apk upgrade`. Once both images scan clean, `SCAN_ENFORCE_CRITICAL` can be switched to `'true'`.
+Both images now scan clean (API image verified in build 32), so SCAN_ENFORCE_CRITICAL can be switched to 'true'.
 
 ## Alerting (Alertmanager, email)
 
@@ -301,6 +304,8 @@ Prometheus evaluates the alert rules and sends firing alerts to Alertmanager, wh
 - Quality gates: `ruff`, a non-blocking `pip-audit` (120 second cap), manifest validation with `kubectl kustomize`, and a Trivy image scan.
 
 ## Deploying to AWS or GCP instead of Minikube
+
+The pipeline runs on Minikube today. The steps below are the plan for running it on AWS or GCP.
 
 The pipeline is written so that moving to a managed cluster changes the credentials and the image step, not the pipeline logic. Everything else (Kustomize overlays, rollout checks, smoke tests, approval gate, rollback) stays the same.
 
