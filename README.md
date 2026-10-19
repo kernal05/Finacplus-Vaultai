@@ -13,7 +13,18 @@ I built and tested all of this on a local Minikube cluster, so a few things (the
 | **If something breaks** | The rollout is undone automatically and prod is never touched. An alert email arrives if the app goes down |
 | **Result** | A full run takes about 14 to 17 minutes here, down from 25 to 30. Moving to a registry should bring it to roughly 10 to 14 (estimate) |
 | **Effort** | About 5 to 7 hours to get the infrastructure running. The rest of the time went into debugging, hardening and documentation |
+| **Live app** | [http://103.192.198.240:7101](http://103.192.198.240:7101), see [Live application](#live-application) |
 | **Runs on** | One laptop (Minikube), no cloud spend. The cloud path is documented as a plan |
+
+## Live application
+
+The application this case study delivers is running here: **[http://103.192.198.240:7101](http://103.192.198.240:7101)**
+
+![VaultAI home page](docs/screenshots/09-vaultai-app-home.png)
+
+This copy is hosted on a server and deployed separately (Docker Compose), not by the Jenkins pipeline in this repository. The same application is what the pipeline builds and ships to the staging and prod namespaces on Kubernetes. I'm linking it so reviewers can see the product itself, not just the delivery pipeline.
+
+It is a demo: plain HTTP on an IP address. For real users I would put it behind HTTPS and a domain name, and rate-limit the endpoints that call the AI model.
 
 ## The assignment, and where each part is answered
 
@@ -472,5 +483,6 @@ The pipeline is written so that moving to a managed cluster changes the credenti
 | Alert firing email (prod API scaled to 0) | ![firing](docs/screenshots/06-alert-firing-email.png) |
 | Alert resolved email | ![resolved](docs/screenshots/07-alert-resolved-email.png) |
 | Prometheus targets | ![prometheus](docs/screenshots/08-prometheus-targets.png) |
+| The VaultAI application (home page) | ![app](docs/screenshots/09-vaultai-app-home.png) |
 
 Note: on this 4.8 GB laptop a full run takes roughly 14 to 17 minutes once Docker layers are cached. A first build, or a run after Minikube hit its memory limit, can take much longer. The slowest remaining step is loading images into Minikube (about three minutes). A registry removes it, and should bring a run to roughly 10 to 14 minutes (estimate, not measured).
