@@ -84,7 +84,7 @@
 <text x="675" y="512" font-size="12" text-anchor="middle" fill="#27500A">api x3, web x3</text><text x="675" y="532" font-size="10.5" text-anchor="middle" fill="#27500A">k8s/overlays/prod</text>
 <rect x="810" y="462" width="230" height="90" rx="6" fill="#E6F1FB" stroke="#378ADD"/>
 <text x="925.0" y="486" text-anchor="middle" font-size="13" font-weight="bold" fill="#0C447C">vaultai-staging</text>
-<text x="925" y="512" font-size="12" text-anchor="middle" fill="#0C447C">api x1, web x1</text><text x="925" y="532" font-size="10.5" text-anchor="middle" fill="#0C447C">k8s/overlays/staging</text>
+<text x="925" y="512" font-size="12" text-anchor="middle" fill="#0C447C">api x2, web x2</text><text x="925" y="532" font-size="10.5" text-anchor="middle" fill="#0C447C">k8s/overlays/staging</text>
 <line x1="900" y1="240" x2="900" y2="458" stroke="#555" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr)"/>
 <line x1="656" y1="340" x2="656" y2="458" stroke="#555" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr)"/>
 <text x="906" y="412" font-size="10.5" fill="#555">deploy</text><text x="662" y="412" font-size="10.5" fill="#555">deploy</text>

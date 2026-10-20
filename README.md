@@ -109,7 +109,7 @@ nginx/default.conf       nginx config, including the API proxy
 k8s/base/                shared Deployments and Services
 k8s/rbac/                namespace-scoped RBAC for the Jenkins deployer (staging, prod)
 docs/screenshots/        evidence screenshots used in this README
-k8s/overlays/staging/    namespace vaultai-staging, 1 replica
+k8s/overlays/staging/    namespace vaultai-staging, 2 replicas
 k8s/overlays/prod/       namespace vaultai-prod, 3 replicas, higher API limits
 jenkins/Dockerfile       Jenkins image with the docker CLI and kubectl added
 jenkins/install-ci-tools.sh  puts ruff and the Trivy database into the running Jenkins container
@@ -310,7 +310,7 @@ To repeat the rollback test, break the probe path in `k8s/base/api-deployment.ya
 
 - Rolling updates use `maxUnavailable: 0` and `maxSurge: 1`, with `progressDeadlineSeconds: 300`, so capacity never drops during a release.
 - Each container has startup, readiness and liveness probes with 5 second timeouts.
-- The pipeline waits up to 300 seconds for each rollout and runs `kubectl rollout undo` automatically if it fails. Staging runs 1 replica per service and prod runs 3, to suit the small local cluster.
+- The pipeline waits up to 300 seconds for each rollout and runs `kubectl rollout undo` automatically if it fails. Staging runs 2 replicas per service and prod runs 3.
 - Quality gates: `ruff`, a non-blocking `pip-audit` (120 second cap), manifest validation with `kubectl kustomize`, and a Trivy image scan.
 
 ## Monitoring and logging
