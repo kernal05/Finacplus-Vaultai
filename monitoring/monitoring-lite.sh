@@ -523,5 +523,5 @@ Open the UIs (each in its own terminal, leave it running):
 
 Grafana login:  admin / $(kubectl -n "$NS" get secret grafana-admin -o jsonpath='{.data.password}' | base64 -d)
 Dashboard:      Dashboards -> "VaultAI - App and CI/CD pipeline"
-Alert rules:    http://localhost:9090/alerts   (no Alertmanager: they show firing/pending but send nothing)
+Alert rules:    http://localhost:9090/alerts   (firing alerts are emailed through Alertmanager)
 EOM
