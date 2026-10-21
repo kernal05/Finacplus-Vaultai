@@ -14,6 +14,11 @@ def appConfig() {
     return [
         deployBranch: 'main',        // only this branch deploys
         minikubeNode: 'minikube',    // local-dev image loading; use a registry push for real clusters
+        // Optional faster path. Leave both empty to load images into Minikube (default).
+        // To use the local registry container, set pushHost: 'localhost:5000' and
+        // pullHost: '192.168.49.10:5000' (needs the one-time node setup in the README).
+        pushHost    : 'localhost:5000',            // where Jenkins pushes (host side)
+        pullHost    : '192.168.49.10:5000',            // how the cluster refers to the same registry
         secretName  : 'vaultai-secrets',
         secretKey   : 'ANTHROPIC_API_KEY',
         components  : [
@@ -68,6 +73,19 @@ def buildImages() {
 
 def loadImages() {
     def app = appConfig()
+    if (app.pushHost) {
+        // Registry path: push only the layers the registry does not already have.
+        for (c in app.components) {
+            withEnv(["IMG=${imageRef(c)}", "PUSH=${app.pushHost}"]) {
+                sh '''
+                    set -e
+                    docker tag "$IMG" "$PUSH/$IMG"
+                    docker push "$PUSH/$IMG"
+                '''
+            }
+        }
+        return
+    }
     for (c in app.components) {
         withEnv(["IMG=${imageRef(c)}", "NODE=${app.minikubeNode}"]) {
             sh '''
@@ -123,8 +141,13 @@ def deployEnv(String envName) {
     // Pin this build's tags in the workspace copy of the overlay (never committed),
     // so ONE apply deploys the right image and rollback goes to the previous real build.
     String pins = "\nimages:\n"
+    String pull = appConfig().pullHost
     for (c in comps) {
-        pins += "  - name: ${c.image}\n    newTag: ${env.IMAGE_TAG}\n"
+        pins += "  - name: ${c.image}\n"
+        if (pull) {
+            pins += "    newName: ${pull}/${c.image}\n"
+        }
+        pins += "    newTag: ${env.IMAGE_TAG}\n"
     }
     writeFile file: 'image-pins.yaml', text: pins
 
